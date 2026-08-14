@@ -9,9 +9,13 @@ set -Eeuo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 test_dir=$(mktemp -d)
 mock_bin="${test_dir}/bin"
+upload_server_pid=""
 mkdir -p "$mock_bin"
 
 cleanup() {
+    if [[ -n $upload_server_pid ]]; then
+        kill "$upload_server_pid" 2>/dev/null || true
+    fi
     rm -rf -- "$test_dir"
 }
 trap cleanup EXIT
@@ -70,16 +74,76 @@ write_mock python3 'exec python "$@"'
 export PATH="${mock_bin}:${PATH}"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.0.0" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.1.0" ]]
 
-bash "${repo_dir}/cpu-benchmark.sh" --quick --output "${test_dir}/success.json" > "${test_dir}/success-console.log"
+upload_port_file="${test_dir}/upload-port"
+upload_capture="${test_dir}/uploaded-reports.jsonl"
+python - "$upload_port_file" "$upload_capture" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+port_file = Path(sys.argv[1])
+capture_file = Path(sys.argv[2])
+request_count = 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global request_count
+        request_count += 1
+        length = int(self.headers.get("Content-Length", "0"))
+        report = json.loads(self.rfile.read(length))
+        with capture_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(report) + "\n")
+        if request_count == 1:
+            response = json.dumps({"reportId": report["report_id"]}).encode()
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+        else:
+            self.send_response(409)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_port), encoding="ascii")
+server.handle_request()
+server.handle_request()
+server.server_close()
+PY
+upload_server_pid=$!
+
+for _attempt in {1..50}; do
+    [[ -s $upload_port_file ]] && break
+    sleep 0.1
+done
+[[ -s $upload_port_file ]]
+upload_port=$(<"$upload_port_file")
+upload_url="http://127.0.0.1:${upload_port}/api/CpuBenchmarks"
+
+bash "${repo_dir}/cpu-benchmark.sh" --quick --output "${test_dir}/success.json" \
+    --upload-url "$upload_url" > "${test_dir}/success-console.log"
+bash "${repo_dir}/cpu-benchmark.sh" --submit "${test_dir}/success.json" \
+    --upload-url "$upload_url" > "${test_dir}/resubmit-console.log"
+wait "$upload_server_pid"
+upload_server_pid=""
+
 python - "${test_dir}/success.json" <<'PY'
 import json
 import sys
+import uuid
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     report = json.load(handle)
 
+uuid.UUID(report["report_id"])
 assert report["system"]["logical_cpus"] == 2
 assert report["benchmarks"]["sysbench_cpu"]["single_core"]["events_per_second"] == 1234.5
 assert len(report["benchmarks"]["sysbench_cpu"]["per_logical_cpu"]) == 2
@@ -88,6 +152,18 @@ assert report["turbostat"]["package_watts"] == 42.5
 assert report["turbostat"]["package_temperature_c"] == 71.0
 assert report["turbostat"]["effective_mhz"] == 3456.0
 assert report["benchmarks"]["stress_ng"]["bogo_operations_per_second"] == 1000.0
+PY
+
+python - "${test_dir}/success.json" "$upload_capture" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    expected = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    submitted = [json.loads(line) for line in handle]
+
+assert submitted == [expected, expected]
 PY
 
 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" --full --output "${test_dir}/optional-failures.json" > "${test_dir}/optional-failures-console.log"

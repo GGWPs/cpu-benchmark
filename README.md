@@ -40,6 +40,15 @@ sudo cpu-benchmark --quick --output /var/tmp/cpu-results
 # Choose the exact JSON filename (the text summary is saved beside it)
 cpu-benchmark --quick --output "$HOME/cpu-result.json"
 
+# Opt in to submitting the completed report to ggwp.eu
+sudo cpu-benchmark --quick --upload
+
+# Use another compatible ingestion endpoint
+sudo cpu-benchmark --full --upload-url https://example.net/api/CpuBenchmarks
+
+# Retry a previously saved report without rerunning the benchmark
+cpu-benchmark --submit /root/cpu-benchmarks/cpu-benchmark-20260814T120000Z.json
+
 # Show or update the installed version
 cpu-benchmark --version
 sudo cpu-benchmark --update
@@ -78,6 +87,21 @@ The JSON contains:
 Restricted performance counters, unsupported CPUs, virtual machines, missing
 sensors, and unavailable optional tools do not abort the benchmark. Their JSON
 sections use `null` values with `unavailable` or `partial` status.
+
+## Uploading results
+
+Uploading is always opt-in. `--upload` submits the completed JSON report to
+`https://ggwp.eu/api/CpuBenchmarks`; `--upload-url URL` targets a compatible
+endpoint and implies `--upload`. `--submit JSON` uploads an existing report
+without rerunning the benchmark. The endpoint stores commonly queried system,
+topology, score, IPC, power, temperature, and clock values as typed database
+columns while retaining the full report as PostgreSQL `jsonb` for optional and
+future metrics.
+
+Reports contain the machine hostname and hardware details shown in the local
+JSON. The server also records the request IP address. If an upload fails, the
+local JSON and text files remain intact and the command returns a non-zero exit
+status so automation can retry the same report ID safely.
 
 To test a development checkout without installing it:
 
