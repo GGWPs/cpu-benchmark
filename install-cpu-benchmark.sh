@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.1.1"
+readonly INSTALLER_VERSION="1.2.0"
 readonly DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly INSTALL_PATH="/usr/local/bin/cpu-benchmark"
 

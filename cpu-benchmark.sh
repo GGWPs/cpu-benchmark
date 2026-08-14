@@ -5,7 +5,7 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.2.0"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
@@ -110,7 +110,7 @@ upload_report() {
     local response
 
     log "Uploading JSON report to $UPLOAD_URL"
-    export UPLOAD_URL JSON_PATH
+    export VERSION UPLOAD_URL JSON_PATH
     if ! response=$(python3 - <<'PY'
 import json
 import os
@@ -133,7 +133,7 @@ request = urllib.request.Request(
     headers={
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "cpu-benchmark/1.1.0",
+        "User-Agent": f"cpu-benchmark/{os.environ['VERSION']}",
     },
 )
 
@@ -231,13 +231,30 @@ fi
 command -v sysbench >/dev/null 2>&1 || die "sysbench is required (run install-cpu-benchmark.sh first)."
 
 case $(uname -s 2>/dev/null || printf unknown) in
-    Linux*) PLATFORM="linux" ;;
-    Darwin*) PLATFORM="macos" ;;
-    MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;
-    *) PLATFORM="unknown" ;;
+    Linux*) RUNTIME_PLATFORM="linux" ;;
+    Darwin*) RUNTIME_PLATFORM="macos" ;;
+    MINGW*|MSYS*|CYGWIN*) RUNTIME_PLATFORM="windows" ;;
+    *) RUNTIME_PLATFORM="unknown" ;;
 esac
 
-if [[ $PLATFORM == "linux" ]] && ! command -v taskset >/dev/null 2>&1; then
+IS_WSL=false
+if [[ $RUNTIME_PLATFORM == "linux" ]] && {
+    [[ ${CPU_BENCHMARK_FORCE_WSL:-0} == "1" ]] ||
+        [[ -n ${WSL_INTEROP:-} ]] ||
+        [[ -n ${WSL_DISTRO_NAME:-} ]] ||
+        grep -Eqi '(microsoft|wsl)' /proc/sys/kernel/osrelease /proc/version 2>/dev/null
+}; then
+    IS_WSL=true
+fi
+
+PLATFORM=$RUNTIME_PLATFORM
+ENVIRONMENT="native"
+if [[ $IS_WSL == true ]]; then
+    PLATFORM="windows"
+    ENVIRONMENT="windows-wsl"
+fi
+
+if [[ $RUNTIME_PLATFORM == "linux" ]] && ! command -v taskset >/dev/null 2>&1; then
     die "taskset is required on Linux (provided by util-linux)."
 fi
 
@@ -278,12 +295,14 @@ SYSTEM_TSV="${TEMP_DIR}/system.tsv"
 SYSBENCH_TSV="${TEMP_DIR}/sysbench.tsv"
 PERF_TSV="${TEMP_DIR}/perf.tsv"
 TURBOSTAT_RAW="${TEMP_DIR}/turbostat.raw"
+WINDOWS_TELEMETRY_RAW="${TEMP_DIR}/windows-host-telemetry.json"
 STRESS_TSV="${TEMP_DIR}/stress.tsv"
 CPUPOWER_RAW="${TEMP_DIR}/cpupower.raw"
 : > "$SYSTEM_TSV"
 : > "$SYSBENCH_TSV"
 : > "$PERF_TSV"
 : > "$TURBOSTAT_RAW"
+printf '{"status":"unavailable","reason":"not_wsl"}\n' > "$WINDOWS_TELEMETRY_RAW"
 : > "$STRESS_TSV"
 : > "$CPUPOWER_RAW"
 
@@ -315,7 +334,7 @@ make_cpu_sequence() {
 collect_system_information() {
     local logical=1 physical=1 sockets=1 threads=1 model="unknown" cpu_list="0"
 
-    case $PLATFORM in
+    case $RUNTIME_PLATFORM in
         linux)
             if command -v lscpu >/dev/null 2>&1; then
                 model=$(LC_ALL=C lscpu | awk -F: '/^Model name:/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
@@ -371,6 +390,7 @@ collect_system_information() {
     CPU_LIST=$cpu_list
 
     system_value platform "$PLATFORM"
+    system_value environment "$ENVIRONMENT"
     system_value hostname "$(hostname 2>/dev/null || printf unknown)"
     system_value kernel "$(uname -srvm 2>/dev/null || printf unknown)"
     system_value cpu_model "$CPU_MODEL"
@@ -428,7 +448,7 @@ run_perf() {
     local raw="${TEMP_DIR}/perf.raw" rc=0 value unit event runtime percentage
     local -a workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
 
-    if [[ $PLATFORM != "linux" ]] || ! command -v perf >/dev/null 2>&1; then
+    if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v perf >/dev/null 2>&1; then
         printf 'status\t\tunavailable\n' >> "$PERF_TSV"
         return 0
     fi
@@ -466,7 +486,7 @@ run_turbostat() {
     local rc=0 diagnostic="${TEMP_DIR}/turbostat-error.raw"
     local -a workload=(taskset -c "$CPU_LIST" sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
 
-    if [[ $PLATFORM != "linux" ]] || ! command -v turbostat >/dev/null 2>&1; then
+    if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v turbostat >/dev/null 2>&1; then
         printf 'unavailable\n' > "$TURBOSTAT_RAW"
         return 0
     fi
@@ -479,9 +499,174 @@ run_turbostat() {
     fi
 }
 
+find_windows_powershell() {
+    local candidate
+
+    if command -v powershell.exe >/dev/null 2>&1; then
+        command -v powershell.exe
+        return 0
+    fi
+
+    for candidate in \
+        /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+        /mnt/c/Program\ Files/PowerShell/7/pwsh.exe; do
+        if [[ -x $candidate ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+collect_windows_host_telemetry() {
+    [[ $IS_WSL == true ]] || return 0
+
+    local powershell_path powershell_script diagnostic workload_pid rc=0
+    local telemetry_duration=$MULTI_DURATION
+    local -a workload
+    diagnostic="${TEMP_DIR}/windows-host-telemetry-error.raw"
+    (( telemetry_duration >= 5 )) || telemetry_duration=5
+
+    if ! powershell_path=$(find_windows_powershell); then
+        printf '{"status":"unavailable","reason":"powershell_interop_unavailable"}\n' > "$WINDOWS_TELEMETRY_RAW"
+        warn "WSL was detected, but Windows PowerShell interop is unavailable."
+        return 0
+    fi
+
+    powershell_script=$(cat <<'POWERSHELL'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$result = [ordered]@{
+    status = 'unavailable'
+    processor_frequency_mhz = $null
+    percent_processor_performance = $null
+    current_clock_mhz = $null
+    maximum_clock_mhz = $null
+    effective_mhz = $null
+    clock_source = $null
+    cpu_temperature_c = $null
+    temperature_source = $null
+    reason = $null
+}
+
+try {
+    $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+    if ($processors.Count -gt 0) {
+        $result.current_clock_mhz = [Math]::Round(
+            [double](($processors | Measure-Object -Property CurrentClockSpeed -Average).Average), 3)
+        $result.maximum_clock_mhz = [Math]::Round(
+            [double](($processors | Measure-Object -Property MaxClockSpeed -Maximum).Maximum), 3)
+    }
+} catch {
+}
+
+try {
+    $performance = Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop |
+        Where-Object Name -eq '_Total' | Select-Object -First 1
+    if ($null -ne $performance) {
+        $frequency = [double]$performance.ProcessorFrequency
+        $percent = [double]$performance.PercentProcessorPerformance
+        if ($frequency -gt 0) {
+            $result.processor_frequency_mhz = [Math]::Round($frequency, 3)
+        }
+        if ($percent -gt 0) {
+            $result.percent_processor_performance = [Math]::Round($percent, 3)
+        }
+        if ($frequency -gt 0 -and $percent -gt 0) {
+            $result.effective_mhz = [Math]::Round($frequency * $percent / 100.0, 3)
+            $result.clock_source = 'windows_processor_information'
+        }
+    }
+} catch {
+}
+
+if ($null -eq $result.effective_mhz -and $result.current_clock_mhz -gt 0) {
+    $result.effective_mhz = $result.current_clock_mhz
+    $result.clock_source = 'win32_processor_current_clock'
+}
+
+$temperatureCandidates = @()
+foreach ($namespace in @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')) {
+    try {
+        $sensors = @(Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction Stop)
+        foreach ($sensor in $sensors) {
+            if ([string]$sensor.SensorType -ne 'Temperature' -or $null -eq $sensor.Value) {
+                continue
+            }
+
+            $parent = [string]$sensor.Parent
+            $identifier = [string]$sensor.Identifier
+            if ($parent -notmatch '^/(amd|intel)cpu/' -and $identifier -notmatch '^/(amd|intel)cpu/') {
+                continue
+            }
+
+            $name = [string]$sensor.Name
+            $priority = 100
+            if ($name -match '^CPU Package$' -or $name -match '^Package') {
+                $priority = 1
+            } elseif ($name -match 'Tdie') {
+                $priority = 2
+            } elseif ($name -match 'Tctl') {
+                $priority = 3
+            }
+
+            if ($priority -lt 100) {
+                $temperatureCandidates += [pscustomobject]@{
+                    Priority = $priority
+                    Value = [double]$sensor.Value
+                    Source = "$namespace/$name"
+                }
+            }
+        }
+    } catch {
+    }
+}
+
+$temperature = $temperatureCandidates |
+    Sort-Object -Property Priority, @{ Expression = 'Value'; Descending = $true } |
+    Select-Object -First 1
+if ($null -ne $temperature) {
+    $result.cpu_temperature_c = [Math]::Round($temperature.Value, 3)
+    $result.temperature_source = $temperature.Source
+}
+
+if ($null -ne $result.effective_mhz -and $null -ne $result.cpu_temperature_c) {
+    $result.status = 'ok'
+} elseif ($null -ne $result.effective_mhz) {
+    $result.status = 'partial'
+    $result.reason = 'hardware_monitor_temperature_unavailable'
+} elseif ($null -ne $result.cpu_temperature_c) {
+    $result.status = 'partial'
+    $result.reason = 'windows_processor_counters_unavailable'
+} else {
+    $result.reason = 'windows_counters_and_hardware_monitor_unavailable'
+}
+
+[Console]::Out.Write(($result | ConvertTo-Json -Compress))
+POWERSHELL
+)
+
+    workload=(taskset -c "$CPU_LIST" sysbench cpu --cpu-max-prime=20000 \
+        --threads="$LOGICAL_CPUS" --time="$telemetry_duration" run)
+    log "Collecting Windows host clock and optional hardware-monitor temperature from WSL..."
+    LC_ALL=C "${workload[@]}" >/dev/null 2>&1 &
+    workload_pid=$!
+    "$powershell_path" -NoLogo -NoProfile -NonInteractive -Command "$powershell_script" \
+        > "$WINDOWS_TELEMETRY_RAW" 2> "$diagnostic" || rc=$?
+    wait "$workload_pid" 2>/dev/null || true
+
+    if (( rc != 0 )) || [[ ! -s $WINDOWS_TELEMETRY_RAW ]]; then
+        printf '{"status":"unavailable","reason":"windows_telemetry_command_failed"}\n' > "$WINDOWS_TELEMETRY_RAW"
+        warn "Windows host telemetry could not be read through WSL interop."
+    fi
+}
+
 run_stress_ng() {
     local raw="${TEMP_DIR}/stress-ng.raw" rc=0 bogo="" real_time="" status="ok"
-    if [[ $PLATFORM != "linux" ]] || ! command -v stress-ng >/dev/null 2>&1; then
+    if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v stress-ng >/dev/null 2>&1; then
         printf 'unavailable\t\t\n' > "$STRESS_TSV"
         return 0
     fi
@@ -498,7 +683,7 @@ run_stress_ng() {
 }
 
 collect_cpupower() {
-    if [[ $PLATFORM == "linux" ]] && command -v cpupower >/dev/null 2>&1; then
+    if [[ $RUNTIME_PLATFORM == "linux" ]] && command -v cpupower >/dev/null 2>&1; then
         LC_ALL=C cpupower frequency-info > "$CPUPOWER_RAW" 2>&1 || true
     fi
 }
@@ -509,7 +694,7 @@ log "Topology: ${SOCKETS} socket(s), ${PHYSICAL_CORES} physical core(s), ${LOGIC
 
 IFS=',' read -r -a ONLINE_CPU_IDS <<< "$CPU_LIST"
 FIRST_CPU=${ONLINE_CPU_IDS[0]:-0}
-if [[ $PLATFORM == "linux" ]]; then
+if [[ $RUNTIME_PLATFORM == "linux" ]]; then
     record_sysbench single "$FIRST_CPU" 1 "$SINGLE_DURATION" "$FIRST_CPU"
     record_sysbench multi "" "$LOGICAL_CPUS" "$MULTI_DURATION" "$CPU_LIST"
     for cpu_id in "${ONLINE_CPU_IDS[@]}"; do
@@ -524,11 +709,12 @@ fi
 
 run_perf
 run_turbostat
+collect_windows_host_telemetry
 run_stress_ng
 collect_cpupower
 
 export VERSION MODE TIMESTAMP PLATFORM JSON_PATH SUMMARY_PATH
-export SYSTEM_TSV SYSBENCH_TSV PERF_TSV TURBOSTAT_RAW STRESS_TSV CPUPOWER_RAW
+export SYSTEM_TSV SYSBENCH_TSV PERF_TSV TURBOSTAT_RAW WINDOWS_TELEMETRY_RAW STRESS_TSV CPUPOWER_RAW
 
 if ! python3 - <<'PY'
 import glob
@@ -639,6 +825,45 @@ def parse_turbostat(path):
     return result
 
 
+def parse_windows_host_telemetry(path):
+    result = {
+        "status": "unavailable",
+        "processor_frequency_mhz": None,
+        "percent_processor_performance": None,
+        "current_clock_mhz": None,
+        "maximum_clock_mhz": None,
+        "effective_mhz": None,
+        "clock_source": None,
+        "cpu_temperature_c": None,
+        "temperature_source": None,
+        "reason": None,
+    }
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8-sig", errors="replace"))
+    except (OSError, ValueError):
+        result["reason"] = "invalid_or_missing_windows_telemetry"
+        return result
+    if not isinstance(payload, dict):
+        result["reason"] = "invalid_windows_telemetry"
+        return result
+    for key in (
+        "processor_frequency_mhz",
+        "percent_processor_performance",
+        "current_clock_mhz",
+        "maximum_clock_mhz",
+        "effective_mhz",
+        "cpu_temperature_c",
+    ):
+        result[key] = number(payload.get(key))
+    for key in ("clock_source", "temperature_source", "reason"):
+        value = payload.get(key)
+        result[key] = value if isinstance(value, str) and value else None
+    status = payload.get("status")
+    if status in {"ok", "partial", "unavailable"}:
+        result["status"] = status
+    return result
+
+
 def collect_frequencies():
     records = []
     for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*"), key=lambda p: number(re.search(r"cpu(\d+)$", p).group(1), True)):
@@ -726,6 +951,16 @@ multi = benchmarks.get("all_logical_cpus") or {}
 single_eps = single.get("events_per_second")
 multi_eps = multi.get("events_per_second")
 scaling = (multi_eps / single_eps) if single_eps and multi_eps else None
+turbostat = parse_turbostat(os.environ["TURBOSTAT_RAW"])
+windows_host_telemetry = parse_windows_host_telemetry(os.environ["WINDOWS_TELEMETRY_RAW"])
+notes = [
+    "No CPU governor, frequency limit, or power limit was changed.",
+    "Unavailable optional metrics are represented by null values and an unavailable or partial status.",
+]
+if system.get("environment") == "windows-wsl":
+    notes.append(
+        "WSL scores include Windows scheduling and virtualization effects and should only be compared with other WSL runs."
+    )
 
 report = {
     "report_id": str(uuid.uuid4()),
@@ -735,6 +970,7 @@ report = {
     "mode": os.environ["MODE"],
     "system": {
         "platform": system.get("platform"),
+        "environment": system.get("environment") or "native",
         "os_release": system.get("os_release"),
         "hostname": system.get("hostname") or socket.gethostname(),
         "kernel": system.get("kernel"),
@@ -753,11 +989,9 @@ report = {
         "stress_ng": stress,
     },
     "performance_counters": perf,
-    "turbostat": parse_turbostat(os.environ["TURBOSTAT_RAW"]),
-    "notes": [
-        "No CPU governor, frequency limit, or power limit was changed.",
-        "Unavailable optional metrics are represented by null values and an unavailable or partial status.",
-    ],
+    "turbostat": turbostat,
+    "windows_host_telemetry": windows_host_telemetry,
+    "notes": notes,
 }
 
 json_path = Path(os.environ["JSON_PATH"])
@@ -768,6 +1002,16 @@ with json_path.open("w", encoding="utf-8") as handle:
 
 per_cpu_scores = [item["events_per_second"] for item in benchmarks["per_logical_cpu"] if item.get("events_per_second") is not None]
 temperatures = [item["temperature_c"] for item in report["temperatures"]["sensors"]]
+cpu_temperature = (
+    turbostat["package_temperature_c"]
+    if turbostat["package_temperature_c"] is not None
+    else windows_host_telemetry["cpu_temperature_c"]
+)
+effective_mhz = (
+    turbostat["effective_mhz"]
+    if turbostat["effective_mhz"] is not None
+    else windows_host_telemetry["effective_mhz"]
+)
 
 
 def fmt(value, suffix="", precision=2):
@@ -780,6 +1024,7 @@ lines = [
     f"Timestamp:          {report['timestamp_utc']}",
     f"Mode:               {report['mode']}",
     f"Platform:           {report['system']['platform']} ({report['system']['os_release']})",
+    f"Environment:        {report['system']['environment']}",
     f"CPU:                {report['system']['cpu_model']}",
     f"Topology:           {report['system']['sockets']} socket(s), {report['system']['physical_cores']} physical core(s), {report['system']['logical_cpus']} logical CPU(s), {report['system']['threads_per_core']} thread(s)/core",
     "",
@@ -803,8 +1048,8 @@ lines.extend([
     "",
     "Telemetry",
     f"  Package watts:    {fmt(report['turbostat']['package_watts'], ' W')}",
-    f"  Package temp:     {fmt(report['turbostat']['package_temperature_c'], ' C')}",
-    f"  Effective clock:  {fmt(report['turbostat']['effective_mhz'], ' MHz')}",
+    f"  CPU temperature:  {fmt(cpu_temperature, ' C')}",
+    f"  Effective clock:  {fmt(effective_mhz, ' MHz')}",
     f"  Max sensor temp:  {fmt(max(temperatures) if temperatures else None, ' C')}",
     "",
     f"JSON report:        {json_path}",
