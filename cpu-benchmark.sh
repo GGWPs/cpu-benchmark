@@ -5,11 +5,15 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
+readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
 MODE="quick"
 OUTPUT_PATH=""
+SUBMIT_PATH=""
+UPLOAD=false
+UPLOAD_URL=${CPU_BENCHMARK_UPLOAD_URL:-$DEFAULT_UPLOAD_URL}
 TEMP_DIR=""
 
 usage() {
@@ -23,6 +27,9 @@ Options:
   --quick          Short benchmark (default)
   --full           Longer, more stable benchmark
   --output PATH    Output directory, or an explicit .json report path
+  --upload         Submit the completed JSON report to ggwp.eu
+  --upload-url URL Submit to a different compatible endpoint (implies --upload)
+  --submit JSON    Submit an existing report without running a benchmark
   --update         Replace this script with the current GitHub version
   --version        Print the version and exit
   -h, --help       Show this help
@@ -99,6 +106,71 @@ update_script() {
     printf 'Updated cpu-benchmark at %s\n' "$target"
 }
 
+upload_report() {
+    local response
+
+    log "Uploading JSON report to $UPLOAD_URL"
+    export UPLOAD_URL JSON_PATH
+    if ! response=$(python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+url = os.environ["UPLOAD_URL"]
+if not url.startswith(("https://", "http://")):
+    print("upload URL must use http:// or https://", file=sys.stderr)
+    raise SystemExit(2)
+
+with open(os.environ["JSON_PATH"], "rb") as handle:
+    payload = handle.read()
+
+request = urllib.request.Request(
+    url,
+    data=payload,
+    method="POST",
+    headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "cpu-benchmark/1.1.0",
+    },
+)
+
+try:
+    with urllib.request.urlopen(request, timeout=30) as result:
+        body = result.read().decode("utf-8", errors="replace")
+        receipt = json.loads(body) if body else {}
+        report_id = receipt.get("reportId") or receipt.get("report_id") or "accepted"
+        print(f"submitted ({report_id})")
+except urllib.error.HTTPError as error:
+    body = error.read().decode("utf-8", errors="replace").strip()
+    if error.code == 409:
+        print("already submitted")
+        raise SystemExit(0)
+    print(f"server returned HTTP {error.code}: {body[:500]}", file=sys.stderr)
+    raise SystemExit(1)
+except (urllib.error.URLError, TimeoutError, ValueError) as error:
+    print(f"upload failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    ); then
+        warn "Upload failed; the local JSON report remains available at $JSON_PATH."
+        if [[ -n ${SUMMARY_PATH:-} && -f $SUMMARY_PATH ]]; then
+            printf 'Upload:             failed (%s)\n' "$UPLOAD_URL" | tee -a "$SUMMARY_PATH"
+        else
+            printf 'Upload: failed (%s)\n' "$UPLOAD_URL"
+        fi
+        return 1
+    fi
+
+    if [[ -n ${SUMMARY_PATH:-} && -f $SUMMARY_PATH ]]; then
+        printf 'Upload:             %s to %s\n' "$response" "$UPLOAD_URL" | tee -a "$SUMMARY_PATH"
+    else
+        printf 'Upload: %s to %s\n' "$response" "$UPLOAD_URL"
+    fi
+}
+
 while (( $# > 0 )); do
     case $1 in
         --quick)
@@ -110,6 +182,21 @@ while (( $# > 0 )); do
         --output)
             (( $# >= 2 )) || die "--output requires a path."
             OUTPUT_PATH=$2
+            shift
+            ;;
+        --upload)
+            UPLOAD=true
+            ;;
+        --upload-url)
+            (( $# >= 2 )) || die "--upload-url requires a URL."
+            UPLOAD_URL=$2
+            UPLOAD=true
+            shift
+            ;;
+        --submit)
+            (( $# >= 2 )) || die "--submit requires a JSON report path."
+            SUBMIT_PATH=$2
+            UPLOAD=true
             shift
             ;;
         --version)
@@ -132,6 +219,15 @@ while (( $# > 0 )); do
 done
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required to create the JSON report."
+
+if [[ -n $SUBMIT_PATH ]]; then
+    JSON_PATH=$SUBMIT_PATH
+    SUMMARY_PATH="${JSON_PATH%.json}.txt"
+    [[ -r $JSON_PATH ]] || die "Cannot read JSON report '$JSON_PATH'."
+    upload_report || exit 1
+    exit 0
+fi
+
 command -v sysbench >/dev/null 2>&1 || die "sysbench is required (run install-cpu-benchmark.sh first)."
 
 case $(uname -s 2>/dev/null || printf unknown) in
@@ -441,6 +537,7 @@ import math
 import os
 import re
 import socket
+import uuid
 from pathlib import Path
 
 
@@ -631,6 +728,7 @@ multi_eps = multi.get("events_per_second")
 scaling = (multi_eps / single_eps) if single_eps and multi_eps else None
 
 report = {
+    "report_id": str(uuid.uuid4()),
     "schema_version": 1,
     "tool": {"name": "cpu-benchmark", "version": os.environ["VERSION"]},
     "timestamp_utc": os.environ["TIMESTAMP"],
@@ -719,3 +817,7 @@ then
 fi
 
 cat "$SUMMARY_PATH"
+
+if [[ $UPLOAD == true ]]; then
+    upload_report || exit 1
+fi
