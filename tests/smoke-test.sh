@@ -106,7 +106,10 @@ export CPU_BENCHMARK_CPU_LIST="0-1"
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
 [[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.4.0" ]]
 [[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.4.0" ]]
-! grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"
+if grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"; then
+    printf 'Installer must not reserve the os-release VERSION variable.\n' >&2
+    exit 1
+fi
 grep -q 'lm-sensors' "${repo_dir}/install-cpu-benchmark.sh"
 grep -q 'Get-WmiObject' "${repo_dir}/cpu-benchmark.sh"
 
@@ -159,11 +162,14 @@ server.server_close()
 PY
 upload_server_pid=$!
 
-for _attempt in {1..50}; do
+for _attempt in {1..150}; do
     [[ -s $upload_port_file ]] && break
     sleep 0.1
 done
-[[ -s $upload_port_file ]]
+if [[ ! -s $upload_port_file ]]; then
+    printf 'Upload test server did not start in time.\n' >&2
+    exit 1
+fi
 upload_port=$(<"$upload_port_file")
 upload_url="http://127.0.0.1:${upload_port}/api/CpuBenchmarks"
 

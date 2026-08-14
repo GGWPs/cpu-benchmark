@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - "feature/**"
   pull_request:
 
 permissions:
@@ -34,6 +33,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: Validate Bash syntax
         run: bash -n cpu-benchmark.sh install-cpu-benchmark.sh tests/*.sh
       - name: Test distribution installer plans

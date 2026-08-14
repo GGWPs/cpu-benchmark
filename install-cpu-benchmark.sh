@@ -335,7 +335,10 @@ PY
     fi
 }
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)
+script_dir=""
+if ! script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P); then
+    warn "Could not resolve the installer directory; the benchmark will be downloaded."
+fi
 source_script="${script_dir}/cpu-benchmark.sh"
 
 if [[ -n $SOURCE_URL || ! -f $source_script ]]; then
