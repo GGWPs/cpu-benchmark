@@ -14,6 +14,12 @@ other tuning settings. It does not use or install Docker.
 curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | sudo bash
 ```
 
+When already logged in as root, as is common on Proxmox VE, omit `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | bash
+```
+
 From a cloned checkout, the installer uses the adjacent `cpu-benchmark.sh`:
 
 ```bash

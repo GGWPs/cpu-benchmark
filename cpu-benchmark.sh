@@ -5,7 +5,7 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
