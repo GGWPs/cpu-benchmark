@@ -10,6 +10,11 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 test_dir=$(mktemp -d)
 mock_bin="${test_dir}/bin"
 upload_server_pid=""
+host_python=$(command -v python3 || command -v python) || {
+    printf 'Python 3 is required for the smoke test.\n' >&2
+    exit 1
+}
+export CPU_BENCHMARK_TEST_PYTHON=$host_python
 mkdir -p "$mock_bin"
 
 cleanup() {
@@ -90,7 +95,7 @@ write_mock cpupower 'printf "current policy: frequency should be within 800 MHz 
 write_mock sensors \
     'printf "%s\n" '\''{"k10temp-pci-00c3":{"Adapter":"PCI adapter","Tctl":{"temp1_input":65.0},"Tdie":{"temp2_input":60.0}}}'\'''
 
-write_mock python3 'exec python "$@"'
+write_mock python3 'exec "$CPU_BENCHMARK_TEST_PYTHON" "$@"'
 
 write_mock powershell.exe \
     'printf "%s\n" '\''{"status":"ok","processor_frequency_mhz":4200,"percent_processor_performance":118,"current_clock_mhz":4200,"maximum_clock_mhz":4200,"effective_mhz":4956,"clock_source":"windows_processor_information","cpu_temperature_c":63.5,"temperature_source":"root\\LibreHardwareMonitor/CPU Package","reason":null}'\'''
@@ -99,15 +104,20 @@ export PATH="${mock_bin}:${PATH}"
 export CPU_BENCHMARK_CPU_LIST="0-1"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.3.0" ]]
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.3.0" ]]
+[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.4.0" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.4.0" ]]
 ! grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"
 grep -q 'lm-sensors' "${repo_dir}/install-cpu-benchmark.sh"
 grep -q 'Get-WmiObject' "${repo_dir}/cpu-benchmark.sh"
 
+bash "${repo_dir}/cpu-benchmark.sh" --check --output "${test_dir}/doctor" \
+    > "${test_dir}/doctor.output"
+grep -q 'all required checks passed' "${test_dir}/doctor.output"
+grep -q 'hardware counters' "${test_dir}/doctor.output"
+
 upload_port_file="${test_dir}/upload-port"
 upload_capture="${test_dir}/uploaded-reports.jsonl"
-python - "$upload_port_file" "$upload_capture" <<'PY' &
+"$host_python" - "$upload_port_file" "$upload_capture" <<'PY' &
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -164,7 +174,7 @@ bash "${repo_dir}/cpu-benchmark.sh" --submit "${test_dir}/success.json" \
 wait "$upload_server_pid"
 upload_server_pid=""
 
-python - "${test_dir}/success.json" <<'PY'
+"$host_python" - "${test_dir}/success.json" <<'PY'
 import json
 import sys
 import uuid
@@ -192,7 +202,7 @@ assert any(
 )
 PY
 
-python - "${test_dir}/success.json" "$upload_capture" <<'PY'
+"$host_python" - "${test_dir}/success.json" "$upload_capture" <<'PY'
 import json
 import sys
 
@@ -206,7 +216,7 @@ PY
 
 CPU_BENCHMARK_FORCE_WSL=1 CPU_BENCHMARK_POWERSHELL=powershell.exe MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
     --quick --output "${test_dir}/wsl.json" > "${test_dir}/wsl-console.log"
-python - "${test_dir}/wsl.json" <<'PY'
+"$host_python" - "${test_dir}/wsl.json" <<'PY'
 import json
 import sys
 
@@ -224,7 +234,7 @@ PY
 
 MOCK_TASKSET_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
     --quick --output "${test_dir}/no-affinity.json" > "${test_dir}/no-affinity-console.log"
-python - "${test_dir}/no-affinity.json" <<'PY'
+"$host_python" - "${test_dir}/no-affinity.json" <<'PY'
 import json
 import sys
 
@@ -239,7 +249,7 @@ PY
 
 BASH_COMPAT=3.2 MOCK_UNAME_S=Darwin MOCK_UNAME_M=arm64 bash "${repo_dir}/cpu-benchmark.sh" \
     --quick --output "${test_dir}/macos.json" > "${test_dir}/macos-console.log"
-python - "${test_dir}/macos.json" <<'PY'
+"$host_python" - "${test_dir}/macos.json" <<'PY'
 import json
 import sys
 
@@ -260,7 +270,7 @@ assert all(
 PY
 
 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" --full --output "${test_dir}/optional-failures.json" > "${test_dir}/optional-failures-console.log"
-python - "${test_dir}/optional-failures.json" <<'PY'
+"$host_python" - "${test_dir}/optional-failures.json" <<'PY'
 import json
 import sys
 

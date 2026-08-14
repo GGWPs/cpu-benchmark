@@ -1,9 +1,10 @@
 # CPU Benchmark Toolkit
 
-A reusable, non-invasive CPU benchmarking toolkit for Debian, Ubuntu,
-Proxmox VE, Windows through WSL, and macOS. It measures sysbench single-core,
-all-logical-CPU, and per-logical-CPU performance and adds Linux hardware
-telemetry when the kernel and processor expose it.
+A reusable, non-invasive CPU benchmarking toolkit for Debian/Ubuntu,
+Proxmox VE, Fedora/RHEL, Amazon Linux, Arch, openSUSE, Alpine, Windows through
+WSL, and macOS. It measures sysbench single-core, all-logical-CPU, and
+per-logical-CPU performance and adds Linux hardware telemetry when the kernel
+and processor expose it.
 
 The toolkit never changes the CPU governor, frequency limits, power limits, or
 other tuning settings. It does not use or install Docker.
@@ -26,11 +27,37 @@ From a cloned checkout, the installer uses the adjacent `cpu-benchmark.sh`:
 sudo bash install-cpu-benchmark.sh
 ```
 
-The installer supports Debian, Ubuntu, and Proxmox VE. It runs `apt-get update`,
-installs the required benchmark tools, and installs the command as
-`/usr/local/bin/cpu-benchmark`. Optional `perf`, `cpupower`, and `turbostat`
-packages vary by distribution and kernel; unavailable packages are skipped.
-`lm-sensors` is installed when available as an additional temperature source.
+The installer automatically detects APT, DNF, YUM, Zypper, Pacman, or APK. This
+covers Debian, Ubuntu and their derivatives, Proxmox VE, Fedora, RHEL, Rocky,
+AlmaLinux, CentOS, Oracle Linux, Amazon Linux, Arch, Manjaro, openSUSE, SUSE,
+and Alpine. It refreshes package indexes, installs the required benchmark
+tools, and installs the command as `/usr/local/bin/cpu-benchmark`. Optional
+`stress-ng`, `perf`, `cpupower`, `turbostat`, and sensor packages are installed
+when the distribution provides them and never block the core installation.
+
+Alpine does not include Bash by default, so bootstrap it first:
+
+```sh
+apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | bash
+```
+
+Useful installer options:
+
+```bash
+# Preview detection and packages without root or system changes
+bash install-cpu-benchmark.sh --dry-run
+
+# Install only the script when dependencies are already managed separately
+curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | sudo bash -s -- --skip-packages
+
+# Custom destination or mirror/source
+sudo bash install-cpu-benchmark.sh --install-path /opt/bin/cpu-benchmark
+sudo bash install-cpu-benchmark.sh --source-url https://mirror.example/cpu-benchmark.sh
+```
+
+The installer does not enable third-party repositories. RHEL-family systems
+must make `sysbench` available through an approved configured repository when
+their base repositories do not provide it.
 
 ## Usage
 
@@ -59,6 +86,10 @@ cpu-benchmark --submit /root/cpu-benchmarks/cpu-benchmark-20260814T120000Z.json
 # Show or update the installed version
 cpu-benchmark --version
 sudo cpu-benchmark --update
+
+# Diagnose required tools and optional telemetry without running a benchmark
+cpu-benchmark --check
+cpu-benchmark --doctor --output "$HOME/cpu-results"
 ```
 
 `--full` can take a while on systems with many logical CPUs because every
@@ -67,8 +98,10 @@ the console as each measurement starts.
 
 ## Platform notes
 
-- **Debian, Ubuntu, and Proxmox VE:** fully supported. Linux per-CPU tests are
-  pinned with `taskset`. Hardware counters use `perf`; package power,
+- **Linux:** Debian/Ubuntu derivatives, Proxmox VE, Fedora/RHEL derivatives,
+  Amazon Linux, Arch derivatives, openSUSE/SUSE, and Alpine have automatic
+  package-manager support. Linux per-CPU tests are pinned with `taskset`.
+  Hardware counters use `perf`; package power,
   temperature, and effective MHz use `turbostat` when supported. In containers
   and restricted services, only CPUs allowed by the current cgroup/cpuset are
   benchmarked. If `taskset` is missing or affinity is blocked, single/all-CPU
@@ -143,6 +176,13 @@ To test a development checkout without installing it:
 ```bash
 bash -n install-cpu-benchmark.sh cpu-benchmark.sh
 tests/smoke-test.sh
+tests/installer-plan-test.sh
 ./cpu-benchmark.sh --version
 ./cpu-benchmark.sh --help
+./cpu-benchmark.sh --check --output /tmp/cpu-results
 ```
+
+GitHub Actions runs ShellCheck plus the installer-plan and benchmark smoke
+suites on both Ubuntu and macOS. The installer-plan suite covers Debian,
+Ubuntu, Mint, Fedora, Rocky, Amazon Linux, Arch, Manjaro, openSUSE, Alpine, and
+manual package-management mode without requiring Docker.

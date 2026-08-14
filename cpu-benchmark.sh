@@ -5,7 +5,7 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
@@ -13,6 +13,7 @@ MODE="quick"
 OUTPUT_PATH=""
 SUBMIT_PATH=""
 UPLOAD=false
+CHECK_ONLY=false
 UPLOAD_URL=${CPU_BENCHMARK_UPLOAD_URL:-$DEFAULT_UPLOAD_URL}
 TEMP_DIR=""
 
@@ -30,6 +31,8 @@ Options:
   --upload         Submit the completed JSON report to ggwp.eu
   --upload-url URL Submit to a different compatible endpoint (implies --upload)
   --submit JSON    Submit an existing report without running a benchmark
+  --check, --doctor
+                   Check required and optional capabilities without benchmarking
   --update         Replace this script with the current GitHub version
   --version        Print the version and exit
   -h, --help       Show this help
@@ -171,6 +174,118 @@ PY
     fi
 }
 
+CHECK_FAILURES=0
+
+check_result() {
+    local requirement=$1 name=$2 state=$3 details=${4:-}
+    printf '  %-11s %-28s %-11s %s\n' "$requirement" "$name" "$state" "$details"
+    if [[ $requirement == "required" && $state != "ok" ]]; then
+        (( CHECK_FAILURES += 1 ))
+    fi
+}
+
+check_command() {
+    local requirement=$1 command_name=$2 description=$3 resolved=""
+    if resolved=$(command -v "$command_name" 2>/dev/null); then
+        check_result "$requirement" "$description" "ok" "$resolved"
+    else
+        check_result "$requirement" "$description" "missing" "$command_name"
+    fi
+}
+
+run_checks() {
+    local perf_paranoid="unknown" temperature_details="none detected" transport=""
+    CHECK_FAILURES=0
+
+    printf 'CPU Benchmark Compatibility Check\n'
+    printf '=================================\n'
+    printf 'Platform: %s (%s)\n\n' "$PLATFORM" "$ENVIRONMENT"
+    printf '  %-11s %-28s %-11s %s\n' "level" "capability" "status" "details"
+
+    if [[ $RUNTIME_PLATFORM == "linux" || $RUNTIME_PLATFORM == "macos" || $IS_WSL == true ]]; then
+        check_result "required" "supported runtime" "ok" "$RUNTIME_PLATFORM"
+    else
+        check_result "required" "supported runtime" "unsupported" "$RUNTIME_PLATFORM"
+    fi
+    check_command "required" bash "Bash"
+    check_command "required" python3 "Python 3"
+    check_command "required" sysbench "sysbench"
+
+    if command -v python3 >/dev/null 2>&1 &&
+        python3 -c 'import json, ssl, urllib.request' >/dev/null 2>&1; then
+        check_result "required" "Python stdlib/TLS" "ok" "json, ssl, urllib"
+    else
+        check_result "required" "Python stdlib/TLS" "missing" "upload/report modules"
+    fi
+
+    if [[ -z $OUTPUT_PATH ]]; then
+        if (( EUID == 0 )); then
+            check_result "required" "default output" "ok" "/root/cpu-benchmarks"
+        else
+            check_result "required" "default output" "blocked" "use root or --output PATH"
+        fi
+    else
+        check_result "required" "custom output" "ok" "$OUTPUT_PATH"
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        transport=$(command -v curl)
+    elif command -v wget >/dev/null 2>&1; then
+        transport=$(command -v wget)
+    elif command -v python3 >/dev/null 2>&1; then
+        transport="python3 urllib"
+    fi
+    if [[ -n $transport ]]; then
+        check_result "recommended" "update transport" "ok" "$transport"
+    else
+        check_result "recommended" "update transport" "missing" "curl, wget, or python3"
+    fi
+
+    if [[ $RUNTIME_PLATFORM == "linux" ]]; then
+        check_command "recommended" taskset "CPU affinity"
+        check_command "recommended" stress-ng "stress workload"
+        check_command "recommended" perf "hardware counters"
+        check_command "recommended" turbostat "package telemetry"
+        check_command "recommended" cpupower "frequency details"
+        check_command "recommended" sensors "lm-sensors"
+
+        if [[ -r /proc/sys/kernel/perf_event_paranoid ]]; then
+            perf_paranoid=$(< /proc/sys/kernel/perf_event_paranoid)
+        fi
+        check_result "info" "perf_event_paranoid" "value" "$perf_paranoid"
+
+        if compgen -G '/sys/class/hwmon/hwmon*/temp*_input' >/dev/null 2>&1; then
+            temperature_details="hwmon"
+        elif compgen -G '/sys/class/thermal/thermal_zone*/temp' >/dev/null 2>&1; then
+            temperature_details="thermal zones"
+        elif command -v sensors >/dev/null 2>&1; then
+            temperature_details="lm-sensors"
+        fi
+        if [[ $temperature_details == "none detected" ]]; then
+            check_result "recommended" "temperature sensors" "unavailable" "$temperature_details"
+        else
+            check_result "recommended" "temperature sensors" "ok" "$temperature_details"
+        fi
+    fi
+
+    if [[ $IS_WSL == true ]]; then
+        if command -v powershell.exe >/dev/null 2>&1 || command -v pwsh.exe >/dev/null 2>&1 ||
+            [[ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
+            check_result "recommended" "Windows telemetry" "ok" "PowerShell interop"
+        else
+            check_result "recommended" "Windows telemetry" "unavailable" "set CPU_BENCHMARK_POWERSHELL"
+        fi
+    fi
+
+    printf '\n'
+    if (( CHECK_FAILURES > 0 )); then
+        printf 'Result: %d required check(s) failed.\n' "$CHECK_FAILURES"
+        return 1
+    fi
+    printf 'Result: all required checks passed; missing recommended metrics remain non-fatal.\n'
+    return 0
+}
+
 while (( $# > 0 )); do
     case $1 in
         --quick)
@@ -199,6 +314,9 @@ while (( $# > 0 )); do
             UPLOAD=true
             shift
             ;;
+        --check|--doctor)
+            CHECK_ONLY=true
+            ;;
         --version)
             printf 'cpu-benchmark %s\n' "$VERSION"
             exit 0
@@ -217,18 +335,6 @@ while (( $# > 0 )); do
     esac
     shift
 done
-
-command -v python3 >/dev/null 2>&1 || die "python3 is required to create the JSON report."
-
-if [[ -n $SUBMIT_PATH ]]; then
-    JSON_PATH=$SUBMIT_PATH
-    SUMMARY_PATH="${JSON_PATH%.json}.txt"
-    [[ -r $JSON_PATH ]] || die "Cannot read JSON report '$JSON_PATH'."
-    upload_report || exit 1
-    exit 0
-fi
-
-command -v sysbench >/dev/null 2>&1 || die "sysbench is required (run install-cpu-benchmark.sh first)."
 
 case $(uname -s 2>/dev/null || printf unknown) in
     Linux*) RUNTIME_PLATFORM="linux" ;;
@@ -253,6 +359,23 @@ if [[ $IS_WSL == true ]]; then
     PLATFORM="windows"
     ENVIRONMENT="windows-wsl"
 fi
+
+if [[ $CHECK_ONLY == true ]]; then
+    run_checks
+    exit $?
+fi
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required to create the JSON report."
+
+if [[ -n $SUBMIT_PATH ]]; then
+    JSON_PATH=$SUBMIT_PATH
+    SUMMARY_PATH="${JSON_PATH%.json}.txt"
+    [[ -r $JSON_PATH ]] || die "Cannot read JSON report '$JSON_PATH'."
+    upload_report || exit 1
+    exit 0
+fi
+
+command -v sysbench >/dev/null 2>&1 || die "sysbench is required (run install-cpu-benchmark.sh first)."
 
 TASKSET_AVAILABLE=false
 if [[ $RUNTIME_PLATFORM == "linux" ]] &&

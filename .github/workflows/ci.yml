@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Lint Bash scripts
+        run: shellcheck cpu-benchmark.sh install-cpu-benchmark.sh tests/*.sh
+
+  tests:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Bash syntax
+        run: bash -n cpu-benchmark.sh install-cpu-benchmark.sh tests/*.sh
+      - name: Test distribution installer plans
+        run: bash tests/installer-plan-test.sh
+      - name: Run benchmark smoke tests
+        run: bash tests/smoke-test.sh
+
+  installer-copy:
+    name: Installer copy path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install without package mutations
+        run: sudo bash install-cpu-benchmark.sh --skip-packages --install-path /tmp/cpu-benchmark
+      - name: Verify installed command
+        run: |
+          test -x /tmp/cpu-benchmark
+          test "$(/tmp/cpu-benchmark --version)" = "cpu-benchmark 1.4.0"
