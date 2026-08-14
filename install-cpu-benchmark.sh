@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.2.0"
+readonly INSTALLER_VERSION="1.3.0"
 readonly DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly INSTALL_PATH="/usr/local/bin/cpu-benchmark"
 
@@ -92,6 +92,7 @@ optional_packages=(
     linux-tools-generic
     linux-cpupower
     turbostat
+    lm-sensors
 )
 
 declare -A seen_packages=()

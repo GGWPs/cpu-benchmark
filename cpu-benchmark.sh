@@ -5,7 +5,7 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
@@ -254,8 +254,11 @@ if [[ $IS_WSL == true ]]; then
     ENVIRONMENT="windows-wsl"
 fi
 
-if [[ $RUNTIME_PLATFORM == "linux" ]] && ! command -v taskset >/dev/null 2>&1; then
-    die "taskset is required on Linux (provided by util-linux)."
+TASKSET_AVAILABLE=false
+if [[ $RUNTIME_PLATFORM == "linux" ]] &&
+    [[ ${CPU_BENCHMARK_DISABLE_AFFINITY:-0} != "1" ]] &&
+    command -v taskset >/dev/null 2>&1; then
+    TASKSET_AVAILABLE=true
 fi
 
 if [[ -z $OUTPUT_PATH && $EUID -ne 0 ]]; then
@@ -298,6 +301,7 @@ TURBOSTAT_RAW="${TEMP_DIR}/turbostat.raw"
 WINDOWS_TELEMETRY_RAW="${TEMP_DIR}/windows-host-telemetry.json"
 STRESS_TSV="${TEMP_DIR}/stress.tsv"
 CPUPOWER_RAW="${TEMP_DIR}/cpupower.raw"
+SENSORS_RAW="${TEMP_DIR}/sensors.json"
 : > "$SYSTEM_TSV"
 : > "$SYSBENCH_TSV"
 : > "$PERF_TSV"
@@ -305,6 +309,7 @@ CPUPOWER_RAW="${TEMP_DIR}/cpupower.raw"
 printf '{"status":"unavailable","reason":"not_wsl"}\n' > "$WINDOWS_TELEMETRY_RAW"
 : > "$STRESS_TSV"
 : > "$CPUPOWER_RAW"
+: > "$SENSORS_RAW"
 
 sanitize_field() {
     printf '%s' "$1" | tr '\t\r\n' '   '
@@ -331,17 +336,85 @@ make_cpu_sequence() {
     printf '%s\n' "$result"
 }
 
+expand_cpu_list() {
+    local ranges=$1
+
+    awk -v ranges="$ranges" 'BEGIN {
+        count = split(ranges, parts, ",")
+        for (part = 1; part <= count; part++) {
+            range_count = split(parts[part], bounds, "-")
+            start = bounds[1]
+            finish = range_count == 2 ? bounds[2] : start
+            if (start !~ /^[0-9]+$/ || finish !~ /^[0-9]+$/ || finish < start) {
+                continue
+            }
+            for (cpu = start; cpu <= finish; cpu++) {
+                printf "%s%d", separator, cpu
+                separator = ","
+            }
+        }
+        print ""
+    }'
+}
+
+detect_linux_cpu_list() {
+    local allowed="" detected=""
+
+    if [[ -n ${CPU_BENCHMARK_CPU_LIST:-} ]]; then
+        detected=$(expand_cpu_list "$CPU_BENCHMARK_CPU_LIST")
+        if [[ -n $detected ]]; then
+            printf '%s\n' "$detected"
+            return 0
+        fi
+    fi
+
+    if [[ -r /proc/self/status ]]; then
+        allowed=$(awk '/^Cpus_allowed_list:/ {print $2; exit}' /proc/self/status 2>/dev/null)
+        if [[ -n $allowed ]]; then
+            detected=$(expand_cpu_list "$allowed")
+        fi
+    fi
+
+    if [[ -z $detected ]] && command -v lscpu >/dev/null 2>&1; then
+        detected=$(LC_ALL=C lscpu -p=CPU,ONLINE 2>/dev/null |
+            awk -F, '!/^#/ && ($2 == "Y" || $2 == "") {printf "%s%s", separator, $1; separator=","}')
+    fi
+
+    if [[ -z $detected ]]; then
+        detected=$(make_cpu_sequence "$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1)")
+    fi
+
+    printf '%s\n' "${detected:-0}"
+}
+
 collect_system_information() {
     local logical=1 physical=1 sockets=1 threads=1 model="unknown" cpu_list="0"
+    local restricted_sockets="" topology=""
 
     case $RUNTIME_PLATFORM in
         linux)
+            cpu_list=$(detect_linux_cpu_list)
+            logical=$(awk -F, '{print NF}' <<< "$cpu_list")
             if command -v lscpu >/dev/null 2>&1; then
                 model=$(LC_ALL=C lscpu | awk -F: '/^Model name:/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
-                logical=$(LC_ALL=C lscpu -p=CPU,ONLINE 2>/dev/null | awk -F, '!/^#/ && ($2 == "Y" || $2 == "") {count++} END {print count+0}')
-                cpu_list=$(LC_ALL=C lscpu -p=CPU,ONLINE 2>/dev/null | awk -F, '!/^#/ && ($2 == "Y" || $2 == "") {printf "%s%s", separator, $1; separator=","}')
-                sockets=$(LC_ALL=C lscpu | awk -F: '/^Socket\(s\):/ {gsub(/[ \t]/, "", $2); print $2; exit}')
-                physical=$(LC_ALL=C lscpu -p=SOCKET,CORE,ONLINE 2>/dev/null | awk -F, '!/^#/ && ($3 == "Y" || $3 == "") {seen[$1 ":" $2]=1} END {print length(seen)}')
+                topology=$(LC_ALL=C lscpu -p=CPU,SOCKET,CORE,ONLINE 2>/dev/null |
+                    awk -F, -v allowed="$cpu_list" 'BEGIN {
+                        count = split(allowed, cpus, ",")
+                        for (item = 1; item <= count; item++) permit[cpus[item]] = 1
+                    }
+                    !/^#/ && ($4 == "Y" || $4 == "") && ($1 in permit) {
+                        cores[$2 ":" $3]=1
+                        socket_ids[$2]=1
+                    }
+                    END {
+                        for (core in cores) core_total++
+                        for (socket_id in socket_ids) socket_total++
+                        print core_total+0, socket_total+0
+                    }')
+                read -r physical restricted_sockets <<< "$topology"
+                if [[ $restricted_sockets =~ ^[0-9]+$ ]] && (( restricted_sockets > 0 )); then
+                    sockets=$restricted_sockets
+                fi
                 threads=$(LC_ALL=C lscpu | awk -F: '/^Thread\(s\) per core:/ {gsub(/[ \t]/, "", $2); print $2; exit}')
             fi
             if [[ -z $model || $model == "unknown" ]]; then
@@ -380,6 +453,10 @@ collect_system_information() {
     [[ $physical =~ ^[0-9]+$ ]] && (( physical > 0 )) || physical=$logical
     [[ $sockets =~ ^[0-9]+$ ]] && (( sockets > 0 )) || sockets=1
     [[ $threads =~ ^[0-9]+$ ]] && (( threads > 0 )) || threads=1
+    if [[ $RUNTIME_PLATFORM == "linux" ]] &&
+        (( physical > 0 && logical >= physical && logical % physical == 0 )); then
+        threads=$(( logical / physical ))
+    fi
     [[ -n $cpu_list ]] || cpu_list=$(make_cpu_sequence "$logical")
 
     CPU_MODEL=${model:-unknown}
@@ -391,6 +468,7 @@ collect_system_information() {
 
     system_value platform "$PLATFORM"
     system_value environment "$ENVIRONMENT"
+    system_value architecture "$(uname -m 2>/dev/null || printf unknown)"
     system_value hostname "$(hostname 2>/dev/null || printf unknown)"
     system_value kernel "$(uname -srvm 2>/dev/null || printf unknown)"
     system_value cpu_model "$CPU_MODEL"
@@ -399,10 +477,15 @@ collect_system_information() {
     system_value logical_cpus "$LOGICAL_CPUS"
     system_value threads_per_core "$THREADS_PER_CORE"
     system_value online_cpu_list "$CPU_LIST"
-    if [[ -r /etc/os-release ]]; then
+    if [[ $RUNTIME_PLATFORM == "linux" && -r /etc/os-release ]]; then
         system_value os_release "$(awk -F= '/^PRETTY_NAME=/{value=substr($0,index($0,"=")+1); gsub(/^"|"$/, "", value); print value}' /etc/os-release)"
     else
         system_value os_release "$(uname -s 2>/dev/null || printf unknown)"
+    fi
+    if [[ $RUNTIME_PLATFORM == "macos" ]]; then
+        system_value frequency_current_hz "$(sysctl -n hw.cpufrequency 2>/dev/null || true)"
+        system_value frequency_minimum_hz "$(sysctl -n hw.cpufrequency_min 2>/dev/null || true)"
+        system_value frequency_maximum_hz "$(sysctl -n hw.cpufrequency_max 2>/dev/null || true)"
     fi
 }
 
@@ -452,7 +535,9 @@ run_perf() {
         printf 'status\t\tunavailable\n' >> "$PERF_TSV"
         return 0
     fi
-    workload=(taskset -c "$CPU_LIST" "${workload[@]}")
+    if [[ $TASKSET_AVAILABLE == true ]]; then
+        workload=(taskset -c "$CPU_LIST" "${workload[@]}")
+    fi
     log "Collecting perf hardware counters..."
     LC_ALL=C perf stat -x ';' -e cycles,instructions,cache-misses,branch-misses -- \
         "${workload[@]}" >/dev/null 2> "$raw" || rc=$?
@@ -484,11 +569,15 @@ run_perf() {
 
 run_turbostat() {
     local rc=0 diagnostic="${TEMP_DIR}/turbostat-error.raw"
-    local -a workload=(taskset -c "$CPU_LIST" sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
+    local -a workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
 
     if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v turbostat >/dev/null 2>&1; then
         printf 'unavailable\n' > "$TURBOSTAT_RAW"
         return 0
+    fi
+
+    if [[ $TASKSET_AVAILABLE == true ]]; then
+        workload=(taskset -c "$CPU_LIST" "${workload[@]}")
     fi
 
     log "Collecting turbostat package power, temperature, and effective MHz..."
@@ -500,16 +589,44 @@ run_turbostat() {
 }
 
 find_windows_powershell() {
-    local candidate
+    local candidate windows_path
 
-    if command -v powershell.exe >/dev/null 2>&1; then
-        command -v powershell.exe
-        return 0
+    if [[ -n ${CPU_BENCHMARK_POWERSHELL:-} ]]; then
+        if command -v "$CPU_BENCHMARK_POWERSHELL" >/dev/null 2>&1; then
+            command -v "$CPU_BENCHMARK_POWERSHELL"
+            return 0
+        fi
+        if [[ -x $CPU_BENCHMARK_POWERSHELL ]]; then
+            printf '%s\n' "$CPU_BENCHMARK_POWERSHELL"
+            return 0
+        fi
+        return 1
+    fi
+
+    for candidate in powershell.exe pwsh.exe; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v wslpath >/dev/null 2>&1; then
+        for windows_path in \
+            'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' \
+            'C:\Program Files\PowerShell\7\pwsh.exe'; do
+            candidate=$(wslpath -u "$windows_path" 2>/dev/null | tr -d '\r')
+            if [[ -n $candidate && -x $candidate ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
     fi
 
     for candidate in \
         /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
-        /mnt/c/Program\ Files/PowerShell/7/pwsh.exe; do
+        /mnt/c/Program\ Files/PowerShell/7/pwsh.exe \
+        /c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+        /c/Program\ Files/PowerShell/7/pwsh.exe; do
         if [[ -x $candidate ]]; then
             printf '%s\n' "$candidate"
             return 0
@@ -537,7 +654,28 @@ collect_windows_host_telemetry() {
     powershell_script=$(cat <<'POWERSHELL'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
+
+function Get-CompatibleInstance {
+    param(
+        [Parameter(Mandatory = $true)][string]$ClassName,
+        [string]$Namespace = 'root\cimv2'
+    )
+
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-CimInstance -Namespace $Namespace -ClassName $ClassName -ErrorAction Stop)
+        } catch {
+        }
+    }
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-WmiObject -Namespace $Namespace -Class $ClassName -ErrorAction Stop)
+        } catch {
+        }
+    }
+    return @()
+}
 
 $result = [ordered]@{
     status = 'unavailable'
@@ -553,7 +691,7 @@ $result = [ordered]@{
 }
 
 try {
-    $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+    $processors = @(Get-CompatibleInstance -ClassName Win32_Processor)
     if ($processors.Count -gt 0) {
         $result.current_clock_mhz = [Math]::Round(
             [double](($processors | Measure-Object -Property CurrentClockSpeed -Average).Average), 3)
@@ -564,11 +702,19 @@ try {
 }
 
 try {
-    $performance = Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop |
-        Where-Object Name -eq '_Total' | Select-Object -First 1
-    if ($null -ne $performance) {
-        $frequency = [double]$performance.ProcessorFrequency
-        $percent = [double]$performance.PercentProcessorPerformance
+    $performanceRows = @(Get-CompatibleInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation)
+    $selectedRows = @($performanceRows | Where-Object Name -eq '_Total')
+    if ($selectedRows.Count -eq 0) {
+        $selectedRows = @($performanceRows | Where-Object Name -match '^[0-9]+,_Total$')
+    }
+    if ($selectedRows.Count -eq 0) {
+        $selectedRows = @($performanceRows | Where-Object Name -notmatch '_Total$')
+    }
+    if ($selectedRows.Count -gt 0) {
+        $frequency = [double](($selectedRows |
+            Measure-Object -Property ProcessorFrequency -Average).Average)
+        $percent = [double](($selectedRows |
+            Measure-Object -Property PercentProcessorPerformance -Average).Average)
         if ($frequency -gt 0) {
             $result.processor_frequency_mhz = [Math]::Round($frequency, 3)
         }
@@ -591,7 +737,7 @@ if ($null -eq $result.effective_mhz -and $result.current_clock_mhz -gt 0) {
 $temperatureCandidates = @()
 foreach ($namespace in @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')) {
     try {
-        $sensors = @(Get-CimInstance -Namespace $namespace -ClassName Sensor -ErrorAction Stop)
+        $sensors = @(Get-CompatibleInstance -Namespace $namespace -ClassName Sensor)
         foreach ($sensor in $sensors) {
             if ([string]$sensor.SensorType -ne 'Temperature' -or $null -eq $sensor.Value) {
                 continue
@@ -649,8 +795,11 @@ if ($null -ne $result.effective_mhz -and $null -ne $result.cpu_temperature_c) {
 POWERSHELL
 )
 
-    workload=(taskset -c "$CPU_LIST" sysbench cpu --cpu-max-prime=20000 \
+    workload=(sysbench cpu --cpu-max-prime=20000 \
         --threads="$LOGICAL_CPUS" --time="$telemetry_duration" run)
+    if [[ $TASKSET_AVAILABLE == true ]]; then
+        workload=(taskset -c "$CPU_LIST" "${workload[@]}")
+    fi
     log "Collecting Windows host clock and optional hardware-monitor temperature from WSL..."
     LC_ALL=C "${workload[@]}" >/dev/null 2>&1 &
     workload_pid=$!
@@ -688,13 +837,23 @@ collect_cpupower() {
     fi
 }
 
+collect_sensors_json() {
+    if [[ $RUNTIME_PLATFORM == "linux" ]] && command -v sensors >/dev/null 2>&1; then
+        LC_ALL=C sensors -j > "$SENSORS_RAW" 2>/dev/null || : > "$SENSORS_RAW"
+    fi
+}
+
 collect_system_information
 log "CPU: $CPU_MODEL"
 log "Topology: ${SOCKETS} socket(s), ${PHYSICAL_CORES} physical core(s), ${LOGICAL_CPUS} logical CPU(s)"
 
 IFS=',' read -r -a ONLINE_CPU_IDS <<< "$CPU_LIST"
 FIRST_CPU=${ONLINE_CPU_IDS[0]:-0}
-if [[ $RUNTIME_PLATFORM == "linux" ]]; then
+if [[ $TASKSET_AVAILABLE == true ]] && ! taskset -c "$FIRST_CPU" true >/dev/null 2>&1; then
+    TASKSET_AVAILABLE=false
+    warn "CPU affinity is not permitted in this environment; continuing without pinned runs."
+fi
+if [[ $RUNTIME_PLATFORM == "linux" && $TASKSET_AVAILABLE == true ]]; then
     record_sysbench single "$FIRST_CPU" 1 "$SINGLE_DURATION" "$FIRST_CPU"
     record_sysbench multi "" "$LOGICAL_CPUS" "$MULTI_DURATION" "$CPU_LIST"
     for cpu_id in "${ONLINE_CPU_IDS[@]}"; do
@@ -712,9 +871,10 @@ run_turbostat
 collect_windows_host_telemetry
 run_stress_ng
 collect_cpupower
+collect_sensors_json
 
 export VERSION MODE TIMESTAMP PLATFORM JSON_PATH SUMMARY_PATH
-export SYSTEM_TSV SYSBENCH_TSV PERF_TSV TURBOSTAT_RAW WINDOWS_TELEMETRY_RAW STRESS_TSV CPUPOWER_RAW
+export SYSTEM_TSV SYSBENCH_TSV PERF_TSV TURBOSTAT_RAW WINDOWS_TELEMETRY_RAW STRESS_TSV CPUPOWER_RAW SENSORS_RAW
 
 if ! python3 - <<'PY'
 import glob
@@ -866,9 +1026,17 @@ def parse_windows_host_telemetry(path):
 
 def collect_frequencies():
     records = []
+    allowed_cpu_ids = {
+        number(item, integer=True)
+        for item in system.get("online_cpu_list", "").split(",")
+        if item != ""
+    }
     for cpu_dir in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*"), key=lambda p: number(re.search(r"cpu(\d+)$", p).group(1), True)):
         match = re.search(r"cpu(\d+)$", cpu_dir)
         if not match:
+            continue
+        cpu_id = int(match.group(1))
+        if allowed_cpu_ids and cpu_id not in allowed_cpu_ids:
             continue
         cpufreq = Path(cpu_dir) / "cpufreq"
         if not cpufreq.exists():
@@ -881,7 +1049,7 @@ def collect_frequencies():
                 return None
 
         records.append({
-            "cpu_id": int(match.group(1)),
+            "cpu_id": cpu_id,
             "current_mhz": (number(read("scaling_cur_freq")) or 0) / 1000 or None,
             "minimum_mhz": (number(read("scaling_min_freq")) or 0) / 1000 or None,
             "maximum_mhz": (number(read("scaling_max_freq")) or 0) / 1000 or None,
@@ -892,12 +1060,37 @@ def collect_frequencies():
         cpupower = Path(os.environ["CPUPOWER_RAW"]).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         cpupower = ""
-    return {"status": "ok" if records else "unavailable", "per_cpu": records, "cpupower_frequency_info": cpupower or None}
+    aggregate = {
+        "current_mhz": (number(system.get("frequency_current_hz")) or 0) / 1_000_000 or None,
+        "minimum_mhz": (number(system.get("frequency_minimum_hz")) or 0) / 1_000_000 or None,
+        "maximum_mhz": (number(system.get("frequency_maximum_hz")) or 0) / 1_000_000 or None,
+    }
+    has_aggregate = any(value is not None for value in aggregate.values())
+    return {
+        "status": "ok" if records or has_aggregate else "unavailable",
+        "per_cpu": records,
+        "aggregate": aggregate if has_aggregate else None,
+        "cpupower_frequency_info": cpupower or None,
+    }
 
 
 def collect_temperatures():
     sensors = []
     seen = set()
+
+    def add_sensor(device, label, temperature, source):
+        if temperature is None or not (-273.15 <= temperature <= 1000):
+            return
+        key = (device, label, round(temperature, 3))
+        if key not in seen:
+            seen.add(key)
+            sensors.append({
+                "device": device,
+                "label": label,
+                "temperature_c": temperature,
+                "source": source,
+            })
+
     for input_path in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
         path = Path(input_path)
         try:
@@ -906,7 +1099,7 @@ def collect_temperatures():
             continue
         if raw is None:
             continue
-        temperature = raw / 1000 if abs(raw) > 500 else raw
+        temperature = raw / 1000
         label_path = path.with_name(path.name.replace("_input", "_label"))
         name_path = path.parent / "name"
         try:
@@ -917,10 +1110,7 @@ def collect_temperatures():
             device = name_path.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             device = path.parent.name
-        key = (device, label, round(temperature, 3))
-        if key not in seen:
-            seen.add(key)
-            sensors.append({"device": device, "label": label, "temperature_c": temperature})
+        add_sensor(device, label, temperature, "hwmon-sysfs")
     for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
         zone_path = Path(zone)
         try:
@@ -930,11 +1120,25 @@ def collect_temperatures():
             continue
         if raw is None:
             continue
-        temperature = raw / 1000 if abs(raw) > 500 else raw
-        key = ("thermal_zone", label, round(temperature, 3))
-        if key not in seen:
-            seen.add(key)
-            sensors.append({"device": "thermal_zone", "label": label, "temperature_c": temperature})
+        add_sensor("thermal_zone", label, raw / 1000, "thermal-sysfs")
+
+    try:
+        sensors_data = json.loads(Path(os.environ["SENSORS_RAW"]).read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        sensors_data = {}
+    if isinstance(sensors_data, dict):
+        for device, features in sensors_data.items():
+            if not isinstance(features, dict):
+                continue
+            normalized_device = re.sub(
+                r"-(?:pci|isa|acpi|virtual)-.*$", "", str(device), flags=re.IGNORECASE)
+            for label, values in features.items():
+                if not isinstance(values, dict):
+                    continue
+                for key, value in values.items():
+                    if re.match(r"^temp[0-9]+_input$", key):
+                        add_sensor(normalized_device, str(label), number(value), "lm-sensors")
     return {"status": "ok" if sensors else "unavailable", "sensors": sensors}
 
 
@@ -971,6 +1175,7 @@ report = {
     "system": {
         "platform": system.get("platform"),
         "environment": system.get("environment") or "native",
+        "architecture": system.get("architecture"),
         "os_release": system.get("os_release"),
         "hostname": system.get("hostname") or socket.gethostname(),
         "kernel": system.get("kernel"),
@@ -1002,6 +1207,16 @@ with json_path.open("w", encoding="utf-8") as handle:
 
 per_cpu_scores = [item["events_per_second"] for item in benchmarks["per_logical_cpu"] if item.get("events_per_second") is not None]
 temperatures = [item["temperature_c"] for item in report["temperatures"]["sensors"]]
+current_clocks = [
+    item["current_mhz"] for item in report["frequency"]["per_cpu"]
+    if item.get("current_mhz") is not None
+]
+frequency_aggregate = report["frequency"].get("aggregate") or {}
+reported_clock_mhz = (
+    sum(current_clocks) / len(current_clocks)
+    if current_clocks
+    else frequency_aggregate.get("current_mhz")
+)
 cpu_temperature = (
     turbostat["package_temperature_c"]
     if turbostat["package_temperature_c"] is not None
@@ -1025,6 +1240,7 @@ lines = [
     f"Mode:               {report['mode']}",
     f"Platform:           {report['system']['platform']} ({report['system']['os_release']})",
     f"Environment:        {report['system']['environment']}",
+    f"Architecture:       {report['system']['architecture']}",
     f"CPU:                {report['system']['cpu_model']}",
     f"Topology:           {report['system']['sockets']} socket(s), {report['system']['physical_cores']} physical core(s), {report['system']['logical_cpus']} logical CPU(s), {report['system']['threads_per_core']} thread(s)/core",
     "",
@@ -1050,6 +1266,7 @@ lines.extend([
     f"  Package watts:    {fmt(report['turbostat']['package_watts'], ' W')}",
     f"  CPU temperature:  {fmt(cpu_temperature, ' C')}",
     f"  Effective clock:  {fmt(effective_mhz, ' MHz')}",
+    f"  Current clock:    {fmt(reported_clock_mhz, ' MHz')}",
     f"  Max sensor temp:  {fmt(max(temperatures) if temperatures else None, ' C')}",
     "",
     f"JSON report:        {json_path}",
