@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.1.1"
 readonly DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly INSTALL_PATH="/usr/local/bin/cpu-benchmark"
 
@@ -20,7 +20,7 @@ die() {
 }
 
 if [[ ${1:-} == "--version" ]]; then
-    printf 'cpu-benchmark installer %s\n' "$VERSION"
+    printf 'cpu-benchmark installer %s\n' "$INSTALLER_VERSION"
     exit 0
 fi
 
@@ -131,4 +131,4 @@ bash -n "$source_script" || die "The benchmark script failed Bash syntax validat
 
 install -m 0755 "$source_script" "$INSTALL_PATH"
 log "Installed cpu-benchmark to $INSTALL_PATH"
-log "Run: sudo cpu-benchmark --quick"
+log "Run: cpu-benchmark --quick"

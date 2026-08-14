@@ -74,7 +74,9 @@ write_mock python3 'exec python "$@"'
 export PATH="${mock_bin}:${PATH}"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.1.0" ]]
+[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.1.1" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.1.1" ]]
+! grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"
 
 upload_port_file="${test_dir}/upload-port"
 upload_capture="${test_dir}/uploaded-reports.jsonl"
