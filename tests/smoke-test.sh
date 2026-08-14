@@ -123,8 +123,9 @@ upload_capture="${test_dir}/uploaded-reports.jsonl"
 "$host_python" - "$upload_port_file" "$upload_capture" <<'PY' &
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import TCPServer
 
 port_file = Path(sys.argv[1])
 capture_file = Path(sys.argv[2])
@@ -154,8 +155,8 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-server = HTTPServer(("127.0.0.1", 0), Handler)
-port_file.write_text(str(server.server_port), encoding="ascii")
+server = TCPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_address[1]), encoding="ascii")
 server.handle_request()
 server.handle_request()
 server.server_close()

@@ -30,8 +30,9 @@ sudo bash install-cpu-benchmark.sh
 The installer automatically detects APT, DNF, YUM, Zypper, Pacman, or APK. This
 covers Debian, Ubuntu and their derivatives, Proxmox VE, Fedora, RHEL, Rocky,
 AlmaLinux, CentOS, Oracle Linux, Amazon Linux, Arch, Manjaro, openSUSE, SUSE,
-and Alpine. It refreshes package indexes, installs the required benchmark
-tools, and installs the command as `/usr/local/bin/cpu-benchmark`. Optional
+and Alpine. It uses the configured package indexes (refreshing them where safe),
+installs the required benchmark tools, and installs the command as
+`/usr/local/bin/cpu-benchmark`. Optional
 `stress-ng`, `perf`, `cpupower`, `turbostat`, and sensor packages are installed
 when the distribution provides them and never block the core installation.
 
