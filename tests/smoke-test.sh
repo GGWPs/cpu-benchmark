@@ -71,11 +71,14 @@ write_mock cpupower 'printf "current policy: frequency should be within 800 MHz 
 
 write_mock python3 'exec python "$@"'
 
+write_mock powershell.exe \
+    'printf "%s\n" '\''{"status":"ok","processor_frequency_mhz":4200,"percent_processor_performance":118,"current_clock_mhz":4200,"maximum_clock_mhz":4200,"effective_mhz":4956,"clock_source":"windows_processor_information","cpu_temperature_c":63.5,"temperature_source":"root\\LibreHardwareMonitor/CPU Package","reason":null}'\'''
+
 export PATH="${mock_bin}:${PATH}"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.1.1" ]]
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.1.1" ]]
+[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.2.0" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.2.0" ]]
 ! grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"
 
 upload_port_file="${test_dir}/upload-port"
@@ -166,6 +169,24 @@ with open(sys.argv[2], encoding="utf-8") as handle:
     submitted = [json.loads(line) for line in handle]
 
 assert submitted == [expected, expected]
+PY
+
+CPU_BENCHMARK_FORCE_WSL=1 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
+    --quick --output "${test_dir}/wsl.json" > "${test_dir}/wsl-console.log"
+python - "${test_dir}/wsl.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+assert report["system"]["platform"] == "windows"
+assert report["system"]["environment"] == "windows-wsl"
+assert report["turbostat"]["status"] == "unavailable"
+assert report["windows_host_telemetry"]["status"] == "ok"
+assert report["windows_host_telemetry"]["effective_mhz"] == 4956
+assert report["windows_host_telemetry"]["cpu_temperature_c"] == 63.5
+assert any("WSL scores" in note for note in report["notes"])
 PY
 
 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" --full --output "${test_dir}/optional-failures.json" > "${test_dir}/optional-failures-console.log"

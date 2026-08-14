@@ -70,8 +70,19 @@ the console as each measurement starts.
   pinned with `taskset`. Hardware counters use `perf`; package power,
   temperature, and effective MHz use `turbostat` when supported.
 - **Windows:** run the installer and benchmark inside a Debian or Ubuntu WSL
-  distribution. Hyper-V/WSL may hide hardware counters and sensors; those
-  fields will be reported as unavailable.
+  distribution. WSL is detected and reported as platform `windows` with the
+  `windows-wsl` environment. During a separate all-core workload, the script
+  uses `powershell.exe` interop to estimate effective MHz from Windows Processor
+  Information counters. WSL scores include Windows scheduling and
+  virtualization effects, so compare them only with other WSL results produced
+  under similar Windows power and workload conditions.
+- **Windows temperature:** Windows does not provide a dependable built-in CPU
+  package-temperature API. To include it, start
+  [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+  or OpenHardwareMonitor as administrator on Windows before running the WSL
+  benchmark. The toolkit reads only CPU Package/Tdie/Tctl values from its WMI
+  provider; it does not substitute ACPI, GPU, storage, or motherboard sensors.
+  The toolkit does not install or start third-party Windows monitoring software.
 - **macOS:** install Bash 4+, Python 3, and sysbench (for example with Homebrew),
   then run `bash cpu-benchmark.sh --quick --output "$HOME/cpu-results"`.
   macOS has no `taskset`, so per-logical-CPU affinity, Linux perf counters, and
@@ -88,6 +99,8 @@ The JSON contains:
 - Single-core, all-CPU, and per-logical-CPU sysbench results
 - cycles, instructions, calculated IPC, cache misses, and branch misses
 - turbostat package watts, package temperature, and effective MHz
+- Windows host effective MHz and optional hardware-monitor CPU temperature when
+  running under WSL
 - stress-ng status and metrics when available
 
 Restricted performance counters, unsupported CPUs, virtual machines, missing
