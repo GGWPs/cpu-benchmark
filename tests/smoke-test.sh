@@ -10,6 +10,11 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 test_dir=$(mktemp -d)
 mock_bin="${test_dir}/bin"
 upload_server_pid=""
+host_python=$(command -v python3 || command -v python) || {
+    printf 'Python 3 is required for the smoke test.\n' >&2
+    exit 1
+}
+export CPU_BENCHMARK_TEST_PYTHON=$host_python
 mkdir -p "$mock_bin"
 
 cleanup() {
@@ -28,18 +33,36 @@ write_mock() {
 }
 
 write_mock uname \
-    'if [[ ${1:-} == "-s" ]]; then printf "Linux\n"; else printf "Linux 6.8.0 mock x86_64\n"; fi'
+    'case ${1:-} in' \
+    '  -s) printf "%s\n" "${MOCK_UNAME_S:-Linux}" ;;' \
+    '  -m) printf "%s\n" "${MOCK_UNAME_M:-x86_64}" ;;' \
+    '  *) printf "Linux 6.8.0 mock x86_64\n" ;;' \
+    'esac'
 
 write_mock hostname 'printf "benchmark-test-host\n"'
+
+write_mock sysctl \
+    'case ${3:-${2:-}} in' \
+    '  machdep.cpu.brand_string) printf "Mock Apple CPU\n" ;;' \
+    '  hw.model) printf "MockMac1,1\n" ;;' \
+    '  hw.logicalcpu) printf "4\n" ;;' \
+    '  hw.physicalcpu) printf "2\n" ;;' \
+    '  hw.packages) printf "1\n" ;;' \
+    '  hw.cpufrequency) printf "3000000000\n" ;;' \
+    '  hw.cpufrequency_min) printf "1200000000\n" ;;' \
+    '  hw.cpufrequency_max) printf "4200000000\n" ;;' \
+    '  *) exit 1 ;;' \
+    'esac'
 
 write_mock lscpu \
     'case "$*" in' \
     '  "-p=CPU,ONLINE") printf "# CPU,ONLINE\n0,Y\n1,Y\n" ;;' \
-    '  "-p=SOCKET,CORE,ONLINE") printf "# SOCKET,CORE,ONLINE\n0,0,Y\n0,1,Y\n" ;;' \
+    '  "-p=CPU,SOCKET,CORE,ONLINE") printf "# CPU,SOCKET,CORE,ONLINE\n0,0,0,Y\n1,0,1,Y\n" ;;' \
     '  *) printf "Model name: Mock CPU 9000\nSocket(s): 1\nThread(s) per core: 1\n" ;;' \
     'esac'
 
 write_mock taskset \
+    '[[ ${MOCK_TASKSET_FAIL:-0} != 1 ]] || exit 1' \
     '[[ ${1:-} == "-c" ]] || exit 2' \
     'shift 2' \
     'exec "$@"'
@@ -69,25 +92,40 @@ write_mock stress-ng \
 
 write_mock cpupower 'printf "current policy: frequency should be within 800 MHz and 4.20 GHz.\n"'
 
-write_mock python3 'exec python "$@"'
+write_mock sensors \
+    'printf "%s\n" '\''{"k10temp-pci-00c3":{"Adapter":"PCI adapter","Tctl":{"temp1_input":65.0},"Tdie":{"temp2_input":60.0}}}'\'''
+
+write_mock python3 'exec "$CPU_BENCHMARK_TEST_PYTHON" "$@"'
 
 write_mock powershell.exe \
     'printf "%s\n" '\''{"status":"ok","processor_frequency_mhz":4200,"percent_processor_performance":118,"current_clock_mhz":4200,"maximum_clock_mhz":4200,"effective_mhz":4956,"clock_source":"windows_processor_information","cpu_temperature_c":63.5,"temperature_source":"root\\LibreHardwareMonitor/CPU Package","reason":null}'\'''
 
 export PATH="${mock_bin}:${PATH}"
+export CPU_BENCHMARK_CPU_LIST="0-1"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.2.0" ]]
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.2.0" ]]
-! grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"
+[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.4.0" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.4.0" ]]
+if grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"; then
+    printf 'Installer must not reserve the os-release VERSION variable.\n' >&2
+    exit 1
+fi
+grep -q 'lm-sensors' "${repo_dir}/install-cpu-benchmark.sh"
+grep -q 'Get-WmiObject' "${repo_dir}/cpu-benchmark.sh"
+
+bash "${repo_dir}/cpu-benchmark.sh" --check --output "${test_dir}/doctor" \
+    > "${test_dir}/doctor.output"
+grep -q 'all required checks passed' "${test_dir}/doctor.output"
+grep -q 'hardware counters' "${test_dir}/doctor.output"
 
 upload_port_file="${test_dir}/upload-port"
 upload_capture="${test_dir}/uploaded-reports.jsonl"
-python - "$upload_port_file" "$upload_capture" <<'PY' &
+"$host_python" - "$upload_port_file" "$upload_capture" <<'PY' &
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import TCPServer
 
 port_file = Path(sys.argv[1])
 capture_file = Path(sys.argv[2])
@@ -117,19 +155,22 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-server = HTTPServer(("127.0.0.1", 0), Handler)
-port_file.write_text(str(server.server_port), encoding="ascii")
+server = TCPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_address[1]), encoding="ascii")
 server.handle_request()
 server.handle_request()
 server.server_close()
 PY
 upload_server_pid=$!
 
-for _attempt in {1..50}; do
+for _attempt in {1..150}; do
     [[ -s $upload_port_file ]] && break
     sleep 0.1
 done
-[[ -s $upload_port_file ]]
+if [[ ! -s $upload_port_file ]]; then
+    printf 'Upload test server did not start in time.\n' >&2
+    exit 1
+fi
 upload_port=$(<"$upload_port_file")
 upload_url="http://127.0.0.1:${upload_port}/api/CpuBenchmarks"
 
@@ -140,7 +181,7 @@ bash "${repo_dir}/cpu-benchmark.sh" --submit "${test_dir}/success.json" \
 wait "$upload_server_pid"
 upload_server_pid=""
 
-python - "${test_dir}/success.json" <<'PY'
+"$host_python" - "${test_dir}/success.json" <<'PY'
 import json
 import sys
 import uuid
@@ -150,6 +191,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 
 uuid.UUID(report["report_id"])
 assert report["system"]["logical_cpus"] == 2
+assert report["system"]["online_cpu_list"] == [0, 1]
 assert report["benchmarks"]["sysbench_cpu"]["single_core"]["events_per_second"] == 1234.5
 assert len(report["benchmarks"]["sysbench_cpu"]["per_logical_cpu"]) == 2
 assert report["performance_counters"]["ipc"] == 2.0
@@ -157,9 +199,17 @@ assert report["turbostat"]["package_watts"] == 42.5
 assert report["turbostat"]["package_temperature_c"] == 71.0
 assert report["turbostat"]["effective_mhz"] == 3456.0
 assert report["benchmarks"]["stress_ng"]["bogo_operations_per_second"] == 1000.0
+assert report["system"]["architecture"] == "x86_64"
+assert any(
+    sensor["device"] == "k10temp"
+    and sensor["label"] == "Tdie"
+    and sensor["temperature_c"] == 60.0
+    and sensor["source"] == "lm-sensors"
+    for sensor in report["temperatures"]["sensors"]
+)
 PY
 
-python - "${test_dir}/success.json" "$upload_capture" <<'PY'
+"$host_python" - "${test_dir}/success.json" "$upload_capture" <<'PY'
 import json
 import sys
 
@@ -171,9 +221,9 @@ with open(sys.argv[2], encoding="utf-8") as handle:
 assert submitted == [expected, expected]
 PY
 
-CPU_BENCHMARK_FORCE_WSL=1 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
+CPU_BENCHMARK_FORCE_WSL=1 CPU_BENCHMARK_POWERSHELL=powershell.exe MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
     --quick --output "${test_dir}/wsl.json" > "${test_dir}/wsl-console.log"
-python - "${test_dir}/wsl.json" <<'PY'
+"$host_python" - "${test_dir}/wsl.json" <<'PY'
 import json
 import sys
 
@@ -189,8 +239,45 @@ assert report["windows_host_telemetry"]["cpu_temperature_c"] == 63.5
 assert any("WSL scores" in note for note in report["notes"])
 PY
 
+MOCK_TASKSET_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" \
+    --quick --output "${test_dir}/no-affinity.json" > "${test_dir}/no-affinity-console.log"
+"$host_python" - "${test_dir}/no-affinity.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+cpu = report["benchmarks"]["sysbench_cpu"]
+assert cpu["single_core"]["status"] == "ok"
+assert cpu["all_logical_cpus"]["status"] == "ok"
+assert all(item["status"] == "unsupported" for item in cpu["per_logical_cpu"])
+PY
+
+BASH_COMPAT=3.2 MOCK_UNAME_S=Darwin MOCK_UNAME_M=arm64 bash "${repo_dir}/cpu-benchmark.sh" \
+    --quick --output "${test_dir}/macos.json" > "${test_dir}/macos-console.log"
+"$host_python" - "${test_dir}/macos.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+assert report["system"]["platform"] == "macos"
+assert report["system"]["architecture"] == "arm64"
+assert report["system"]["cpu_model"] == "Mock Apple CPU"
+assert report["system"]["logical_cpus"] == 4
+assert report["frequency"]["aggregate"]["current_mhz"] == 3000
+assert report["frequency"]["aggregate"]["maximum_mhz"] == 4200
+assert len(report["benchmarks"]["sysbench_cpu"]["per_logical_cpu"]) == 4
+assert all(
+    item["status"] == "unsupported"
+    for item in report["benchmarks"]["sysbench_cpu"]["per_logical_cpu"]
+)
+PY
+
 MOCK_OPTIONAL_FAIL=1 bash "${repo_dir}/cpu-benchmark.sh" --full --output "${test_dir}/optional-failures.json" > "${test_dir}/optional-failures-console.log"
-python - "${test_dir}/optional-failures.json" <<'PY'
+"$host_python" - "${test_dir}/optional-failures.json" <<'PY'
 import json
 import sys
 
