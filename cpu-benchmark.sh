@@ -5,7 +5,7 @@
 # hardware where perf, turbostat, cpufreq, or thermal sensors are unavailable.
 set -uo pipefail
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_UPLOAD_URL="https://ggwp.eu/api/CpuBenchmarks"
 
@@ -16,6 +16,8 @@ UPLOAD=false
 CHECK_ONLY=false
 UPLOAD_URL=${CPU_BENCHMARK_UPLOAD_URL:-$DEFAULT_UPLOAD_URL}
 TEMP_DIR=""
+BENCHMARK_ENGINE=""
+PORTABLE_BENCHMARK=""
 
 usage() {
     cat <<'USAGE'
@@ -176,6 +178,20 @@ PY
 
 CHECK_FAILURES=0
 
+detect_cgroup_cpu_quota() {
+    local quota="" period=""
+    if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+        read -r quota period < /sys/fs/cgroup/cpu.max || true
+    elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+        quota=$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+        period=$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    fi
+    if [[ $quota =~ ^[0-9]+$ && $period =~ ^[0-9]+$ ]] &&
+        (( quota > 0 && period > 0 )); then
+        awk -v quota="$quota" -v period="$period" 'BEGIN {printf "%.3f", quota / period}'
+    fi
+}
+
 check_result() {
     local requirement=$1 name=$2 state=$3 details=${4:-}
     printf '  %-11s %-28s %-11s %s\n' "$requirement" "$name" "$state" "$details"
@@ -194,7 +210,7 @@ check_command() {
 }
 
 run_checks() {
-    local perf_paranoid="unknown" temperature_details="none detected" transport=""
+    local cpu_quota="unlimited" output_target="" perf_paranoid="unknown" temperature_details="none detected" transport=""
     CHECK_FAILURES=0
 
     printf 'CPU Benchmark Compatibility Check\n'
@@ -209,7 +225,11 @@ run_checks() {
     fi
     check_command "required" bash "Bash"
     check_command "required" python3 "Python 3"
-    check_command "required" sysbench "sysbench"
+    if command -v sysbench >/dev/null 2>&1; then
+        check_result "recommended" "sysbench engine" "ok" "$(command -v sysbench)"
+    else
+        check_result "recommended" "sysbench engine" "fallback" "portable Python engine"
+    fi
 
     if command -v python3 >/dev/null 2>&1 &&
         python3 -c 'import json, ssl, urllib.request' >/dev/null 2>&1; then
@@ -219,13 +239,10 @@ run_checks() {
     fi
 
     if [[ -z $OUTPUT_PATH ]]; then
-        if (( EUID == 0 )); then
-            check_result "required" "default output" "ok" "/root/cpu-benchmarks"
-        else
-            check_result "required" "default output" "blocked" "use root or --output PATH"
-        fi
+        output_target=$(default_output_dir)
+        check_output_destination "default output" "$output_target"
     else
-        check_result "required" "custom output" "ok" "$OUTPUT_PATH"
+        check_output_destination "custom output" "$OUTPUT_PATH"
     fi
 
     if command -v curl >/dev/null 2>&1; then
@@ -253,6 +270,8 @@ run_checks() {
             perf_paranoid=$(< /proc/sys/kernel/perf_event_paranoid)
         fi
         check_result "info" "perf_event_paranoid" "value" "$perf_paranoid"
+        cpu_quota=$(detect_cgroup_cpu_quota)
+        check_result "info" "cgroup CPU quota" "value" "${cpu_quota:-unlimited}"
 
         if compgen -G '/sys/class/hwmon/hwmon*/temp*_input' >/dev/null 2>&1; then
             temperature_details="hwmon"
@@ -360,6 +379,67 @@ if [[ $IS_WSL == true ]]; then
     ENVIRONMENT="windows-wsl"
 fi
 
+detect_linux_environment() {
+    local virtualization=""
+    [[ $RUNTIME_PLATFORM == "linux" && $IS_WSL != true ]] || return 0
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virtualization=$(systemd-detect-virt --container 2>/dev/null || true)
+        if [[ -n $virtualization && $virtualization != "none" ]]; then
+            ENVIRONMENT="linux-container:${virtualization}"
+            return 0
+        fi
+        virtualization=$(systemd-detect-virt --vm 2>/dev/null || true)
+        if [[ -n $virtualization && $virtualization != "none" ]]; then
+            ENVIRONMENT="linux-vm:${virtualization}"
+            return 0
+        fi
+    fi
+    if [[ -e /.dockerenv ]]; then
+        ENVIRONMENT="linux-container:docker"
+    elif [[ -e /run/.containerenv ]]; then
+        ENVIRONMENT="linux-container"
+    elif grep -Eqi '(docker|containerd|kubepods|lxc|openvz|podman)' /proc/1/cgroup 2>/dev/null; then
+        ENVIRONMENT="linux-container"
+    fi
+}
+
+default_output_dir() {
+    if (( EUID == 0 )) && [[ -d /root && -w /root ]]; then
+        printf '/root/cpu-benchmarks\n'
+    elif [[ -n ${XDG_STATE_HOME:-} && -d $XDG_STATE_HOME && -w $XDG_STATE_HOME ]]; then
+        printf '%s/cpu-benchmarks\n' "$XDG_STATE_HOME"
+    elif [[ -n ${HOME:-} && -d $HOME && -w $HOME ]]; then
+        printf '%s/.local/state/cpu-benchmarks\n' "$HOME"
+    elif [[ -d /var/tmp && -w /var/tmp ]]; then
+        printf '/var/tmp/cpu-benchmarks-%s\n' "$EUID"
+    else
+        printf '/tmp/cpu-benchmarks-%s\n' "$EUID"
+    fi
+}
+
+check_output_destination() {
+    local name=$1 target=$2 directory existing parent
+    if [[ $target == *.json ]]; then
+        directory=$(dirname -- "$target")
+    else
+        directory=$target
+    fi
+    existing=$directory
+    while [[ ! -e $existing ]]; do
+        parent=$(dirname -- "$existing")
+        [[ $parent != "$existing" ]] || break
+        existing=$parent
+    done
+    if [[ -d $existing && -w $existing ]]; then
+        check_result "required" "$name" "ok" "$target"
+    else
+        check_result "required" "$name" "blocked" "nearest parent is not writable: $existing"
+    fi
+}
+
+detect_linux_environment
+
 if [[ $CHECK_ONLY == true ]]; then
     run_checks
     exit $?
@@ -375,17 +455,18 @@ if [[ -n $SUBMIT_PATH ]]; then
     exit 0
 fi
 
-command -v sysbench >/dev/null 2>&1 || die "sysbench is required (run install-cpu-benchmark.sh first)."
+if command -v sysbench >/dev/null 2>&1; then
+    BENCHMARK_ENGINE="sysbench"
+else
+    BENCHMARK_ENGINE="portable_python"
+    warn "sysbench is unavailable; using the portable Python CPU engine. Compare its scores only with other portable_python runs."
+fi
 
 TASKSET_AVAILABLE=false
 if [[ $RUNTIME_PLATFORM == "linux" ]] &&
     [[ ${CPU_BENCHMARK_DISABLE_AFFINITY:-0} != "1" ]] &&
     command -v taskset >/dev/null 2>&1; then
     TASKSET_AVAILABLE=true
-fi
-
-if [[ -z $OUTPUT_PATH && $EUID -ne 0 ]]; then
-    die "The default output is /root/cpu-benchmarks; run as root or provide --output PATH."
 fi
 
 if [[ $MODE == "quick" ]]; then
@@ -403,7 +484,7 @@ fi
 TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 FILE_TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
 if [[ -z $OUTPUT_PATH ]]; then
-    OUTPUT_DIR="/root/cpu-benchmarks"
+    OUTPUT_DIR=$(default_output_dir)
     JSON_PATH="${OUTPUT_DIR}/cpu-benchmark-${FILE_TIMESTAMP}.json"
 elif [[ $OUTPUT_PATH == *.json ]]; then
     JSON_PATH=$OUTPUT_PATH
@@ -425,6 +506,7 @@ WINDOWS_TELEMETRY_RAW="${TEMP_DIR}/windows-host-telemetry.json"
 STRESS_TSV="${TEMP_DIR}/stress.tsv"
 CPUPOWER_RAW="${TEMP_DIR}/cpupower.raw"
 SENSORS_RAW="${TEMP_DIR}/sensors.json"
+PORTABLE_BENCHMARK="${TEMP_DIR}/portable-cpu-benchmark.py"
 : > "$SYSTEM_TSV"
 : > "$SYSBENCH_TSV"
 : > "$PERF_TSV"
@@ -433,6 +515,90 @@ printf '{"status":"unavailable","reason":"not_wsl"}\n' > "$WINDOWS_TELEMETRY_RAW
 : > "$STRESS_TSV"
 : > "$CPUPOWER_RAW"
 : > "$SENSORS_RAW"
+
+cat > "$PORTABLE_BENCHMARK" <<'PY'
+#!/usr/bin/env python3
+"""Small dependency-free CPU workload used when sysbench is unavailable."""
+
+import argparse
+import math
+import multiprocessing
+import queue
+import time
+
+
+def prime_batch(limit):
+    total = 0
+    for candidate in range(2, limit + 1):
+        prime = True
+        boundary = int(math.sqrt(candidate))
+        for divisor in range(2, boundary + 1):
+            if candidate % divisor == 0:
+                prime = False
+                break
+        if prime:
+            total += 1
+    return total
+
+
+def worker(deadline, result_queue):
+    events = 0
+    checksum = 0
+    while time.monotonic() < deadline:
+        checksum ^= prime_batch(5000)
+        events += 1
+    result_queue.put((events, checksum))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--threads", type=int, required=True)
+    parser.add_argument("--time", type=float, required=True)
+    options = parser.parse_args()
+    threads = max(1, options.threads)
+    duration = max(0.1, options.time)
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        context = multiprocessing.get_context()
+    result_queue = context.Queue()
+    started = time.monotonic()
+    deadline = started + duration
+    requested_workers = [
+        context.Process(target=worker, args=(deadline, result_queue))
+        for _ in range(threads)
+    ]
+    workers = []
+    for process in requested_workers:
+        try:
+            process.start()
+            workers.append(process)
+        except (OSError, RuntimeError):
+            break
+    if not workers:
+        worker(deadline, result_queue)
+    for process in workers:
+        process.join(duration + 10)
+    events = 0
+    for _ in range(max(1, len(workers))):
+        try:
+            worker_events, _checksum = result_queue.get(timeout=1)
+            events += worker_events
+        except queue.Empty:
+            break
+    for process in workers:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+    elapsed = max(time.monotonic() - started, 0.000001)
+    print(f"events per second: {events / elapsed:.6f}")
+    print(f"total time: {elapsed:.6f}s")
+    print(f"total number of events: {events}")
+
+
+if __name__ == "__main__":
+    main()
+PY
 
 sanitize_field() {
     printf '%s' "$1" | tr '\t\r\n' '   '
@@ -510,6 +676,27 @@ detect_linux_cpu_list() {
     printf '%s\n' "${detected:-0}"
 }
 
+detect_linux_topology_sysfs() {
+    local cpu_list=$1 cpu_id package_id core_id
+    local -a cpu_ids
+    IFS=',' read -r -a cpu_ids <<< "$cpu_list"
+    for cpu_id in "${cpu_ids[@]}"; do
+        package_id=""
+        core_id=""
+        [[ -r /sys/devices/system/cpu/cpu${cpu_id}/topology/physical_package_id ]] &&
+            package_id=$(< "/sys/devices/system/cpu/cpu${cpu_id}/topology/physical_package_id")
+        [[ -r /sys/devices/system/cpu/cpu${cpu_id}/topology/core_id ]] &&
+            core_id=$(< "/sys/devices/system/cpu/cpu${cpu_id}/topology/core_id")
+        printf '%s:%s\n' "${package_id:-0}" "${core_id:-$cpu_id}"
+    done | awk -F: '
+        {cores[$1 ":" $2]=1; sockets[$1]=1}
+        END {
+            for (core in cores) core_total++
+            for (socket_id in sockets) socket_total++
+            print core_total+0, socket_total+0
+        }'
+}
+
 collect_system_information() {
     local logical=1 physical=1 sockets=1 threads=1 model="unknown" cpu_list="0"
     local restricted_sockets="" topology=""
@@ -539,6 +726,13 @@ collect_system_information() {
                     sockets=$restricted_sockets
                 fi
                 threads=$(LC_ALL=C lscpu | awk -F: '/^Thread\(s\) per core:/ {gsub(/[ \t]/, "", $2); print $2; exit}')
+            fi
+            if [[ -z $topology || $topology == "0 0" ]]; then
+                topology=$(detect_linux_topology_sysfs "$cpu_list")
+                read -r physical restricted_sockets <<< "$topology"
+                if [[ $restricted_sockets =~ ^[0-9]+$ ]] && (( restricted_sockets > 0 )); then
+                    sockets=$restricted_sockets
+                fi
             fi
             if [[ -z $model || $model == "unknown" ]]; then
                 model=$(awk -F: '/model name|Hardware|Processor/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
@@ -600,6 +794,7 @@ collect_system_information() {
     system_value logical_cpus "$LOGICAL_CPUS"
     system_value threads_per_core "$THREADS_PER_CORE"
     system_value online_cpu_list "$CPU_LIST"
+    system_value cgroup_cpu_quota_cores "$(detect_cgroup_cpu_quota)"
     if [[ $RUNTIME_PLATFORM == "linux" && -r /etc/os-release ]]; then
         system_value os_release "$(awk -F= '/^PRETTY_NAME=/{value=substr($0,index($0,"=")+1); gsub(/^"|"$/, "", value); print value}' /etc/os-release)"
     else
@@ -621,13 +816,19 @@ record_sysbench() {
     local kind=$1 cpu_id=$2 threads=$3 duration=$4 affinity=$5
     local raw="${TEMP_DIR}/sysbench-${kind}-${cpu_id:-all}.raw"
     local status="ok" error="" eps="" events="" elapsed="" rc=0
-    local -a command=(sysbench cpu --cpu-max-prime=20000 --threads="$threads" --time="$duration" run)
+    local -a command
+
+    if [[ $BENCHMARK_ENGINE == "sysbench" ]]; then
+        command=(sysbench cpu --cpu-max-prime=20000 --threads="$threads" --time="$duration" run)
+    else
+        command=(python3 "$PORTABLE_BENCHMARK" --threads "$threads" --time "$duration")
+    fi
 
     if [[ -n $affinity ]]; then
         command=(taskset -c "$affinity" "${command[@]}")
     fi
 
-    log "Running ${kind} sysbench (${threads} thread(s), ${duration}s)..."
+    log "Running ${kind} CPU benchmark with ${BENCHMARK_ENGINE} (${threads} thread(s), ${duration}s)..."
     LC_ALL=C "${command[@]}" > "$raw" 2>&1 || rc=$?
     eps=$(parse_sysbench_value 'events per second:' "$raw")
     events=$(parse_sysbench_value 'total number of events:' "$raw")
@@ -635,7 +836,7 @@ record_sysbench() {
     if (( rc != 0 )) || [[ -z $eps ]]; then
         status="error"
         error=$(tail -n 3 "$raw" 2>/dev/null | tr '\n\t' '  ')
-        warn "${kind} sysbench did not produce a score${cpu_id:+ for CPU $cpu_id}."
+        warn "${kind} CPU benchmark did not produce a score${cpu_id:+ for CPU $cpu_id}."
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$kind" "$cpu_id" "$threads" "$eps" "$events" "$elapsed" "$status" "$(sanitize_field "$error")" >> "$SYSBENCH_TSV"
@@ -652,7 +853,13 @@ record_unsupported_per_cpu() {
 
 run_perf() {
     local raw="${TEMP_DIR}/perf.raw" rc=0 value unit event runtime percentage
-    local -a workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
+    local -a workload
+
+    if [[ $BENCHMARK_ENGINE == "sysbench" ]]; then
+        workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
+    else
+        workload=(python3 "$PORTABLE_BENCHMARK" --threads "$LOGICAL_CPUS" --time "$MULTI_DURATION")
+    fi
 
     if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v perf >/dev/null 2>&1; then
         printf 'status\t\tunavailable\n' >> "$PERF_TSV"
@@ -692,7 +899,13 @@ run_perf() {
 
 run_turbostat() {
     local rc=0 diagnostic="${TEMP_DIR}/turbostat-error.raw"
-    local -a workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
+    local -a workload
+
+    if [[ $BENCHMARK_ENGINE == "sysbench" ]]; then
+        workload=(sysbench cpu --cpu-max-prime=20000 --threads="$LOGICAL_CPUS" --time="$MULTI_DURATION" run)
+    else
+        workload=(python3 "$PORTABLE_BENCHMARK" --threads "$LOGICAL_CPUS" --time "$MULTI_DURATION")
+    fi
 
     if [[ $RUNTIME_PLATFORM != "linux" ]] || ! command -v turbostat >/dev/null 2>&1; then
         printf 'unavailable\n' > "$TURBOSTAT_RAW"
@@ -918,8 +1131,12 @@ if ($null -ne $result.effective_mhz -and $null -ne $result.cpu_temperature_c) {
 POWERSHELL
 )
 
-    workload=(sysbench cpu --cpu-max-prime=20000 \
-        --threads="$LOGICAL_CPUS" --time="$telemetry_duration" run)
+    if [[ $BENCHMARK_ENGINE == "sysbench" ]]; then
+        workload=(sysbench cpu --cpu-max-prime=20000 \
+            --threads="$LOGICAL_CPUS" --time="$telemetry_duration" run)
+    else
+        workload=(python3 "$PORTABLE_BENCHMARK" --threads "$LOGICAL_CPUS" --time "$telemetry_duration")
+    fi
     if [[ $TASKSET_AVAILABLE == true ]]; then
         workload=(taskset -c "$CPU_LIST" "${workload[@]}")
     fi
@@ -996,7 +1213,7 @@ run_stress_ng
 collect_cpupower
 collect_sensors_json
 
-export VERSION MODE TIMESTAMP PLATFORM JSON_PATH SUMMARY_PATH
+export VERSION MODE TIMESTAMP PLATFORM JSON_PATH SUMMARY_PATH BENCHMARK_ENGINE
 export SYSTEM_TSV SYSBENCH_TSV PERF_TSV TURBOSTAT_RAW WINDOWS_TELEMETRY_RAW STRESS_TSV CPUPOWER_RAW SENSORS_RAW
 
 if ! python3 - <<'PY'
@@ -1033,7 +1250,12 @@ def read_tsv(path):
 
 system = {row[0]: row[1] if len(row) > 1 else "" for row in read_tsv(os.environ["SYSTEM_TSV"])}
 
-benchmarks = {"single_core": None, "all_logical_cpus": None, "per_logical_cpu": []}
+benchmarks = {
+    "engine": os.environ["BENCHMARK_ENGINE"],
+    "single_core": None,
+    "all_logical_cpus": None,
+    "per_logical_cpu": [],
+}
 for row in read_tsv(os.environ["SYSBENCH_TSV"]):
     row += [""] * (8 - len(row))
     result = {
@@ -1288,6 +1510,10 @@ if system.get("environment") == "windows-wsl":
     notes.append(
         "WSL scores include Windows scheduling and virtualization effects and should only be compared with other WSL runs."
     )
+if os.environ["BENCHMARK_ENGINE"] == "portable_python":
+    notes.append(
+        "sysbench was unavailable; CPU scores use the portable Python engine and are only comparable with portable_python runs."
+    )
 
 report = {
     "report_id": str(uuid.uuid4()),
@@ -1307,6 +1533,7 @@ report = {
         "physical_cores": number(system.get("physical_cores"), integer=True),
         "logical_cpus": number(system.get("logical_cpus"), integer=True),
         "threads_per_core": number(system.get("threads_per_core"), integer=True),
+        "cgroup_cpu_quota_cores": number(system.get("cgroup_cpu_quota_cores")),
         "online_cpu_list": [number(item, integer=True) for item in system.get("online_cpu_list", "").split(",") if item != ""],
     },
     "frequency": collect_frequencies(),
@@ -1368,6 +1595,7 @@ lines = [
     f"Topology:           {report['system']['sockets']} socket(s), {report['system']['physical_cores']} physical core(s), {report['system']['logical_cpus']} logical CPU(s), {report['system']['threads_per_core']} thread(s)/core",
     "",
     "Performance",
+    f"  Engine:           {benchmarks['engine']}",
     f"  Single core:      {fmt(single_eps, ' events/s')}",
     f"  All logical CPUs: {fmt(multi_eps, ' events/s')}",
     f"  Scaling:          {fmt(scaling, 'x')}",
