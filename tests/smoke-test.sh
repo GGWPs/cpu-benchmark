@@ -123,7 +123,7 @@ grep -Eq 'default output[[:space:]]+ok' "${test_dir}/doctor-default-output.outpu
 
 if (( EUID != 0 )); then
     mkdir -p "${test_dir}/home"
-    HOME="${test_dir}/home" XDG_STATE_HOME= CPU_BENCHMARK_CPU_LIST=0 \
+    HOME="${test_dir}/home" XDG_STATE_HOME='' CPU_BENCHMARK_CPU_LIST=0 \
         bash "${repo_dir}/cpu-benchmark.sh" --quick > "${test_dir}/non-root-console.log"
     compgen -G "${test_dir}/home/.local/state/cpu-benchmarks/*.json" >/dev/null
 fi
