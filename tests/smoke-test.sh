@@ -104,8 +104,8 @@ export PATH="${mock_bin}:${PATH}"
 export CPU_BENCHMARK_CPU_LIST="0-1"
 
 bash -n "${repo_dir}/install-cpu-benchmark.sh" "${repo_dir}/cpu-benchmark.sh"
-[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.4.0" ]]
-[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.4.0" ]]
+[[ $(bash "${repo_dir}/install-cpu-benchmark.sh" --version) == "cpu-benchmark installer 1.5.0" ]]
+[[ $(bash "${repo_dir}/cpu-benchmark.sh" --version) == "cpu-benchmark 1.5.0" ]]
 if grep -Eq '^readonly VERSION=' "${repo_dir}/install-cpu-benchmark.sh"; then
     printf 'Installer must not reserve the os-release VERSION variable.\n' >&2
     exit 1
@@ -117,6 +117,16 @@ bash "${repo_dir}/cpu-benchmark.sh" --check --output "${test_dir}/doctor" \
     > "${test_dir}/doctor.output"
 grep -q 'all required checks passed' "${test_dir}/doctor.output"
 grep -q 'hardware counters' "${test_dir}/doctor.output"
+
+bash "${repo_dir}/cpu-benchmark.sh" --check > "${test_dir}/doctor-default-output.output"
+grep -Eq 'default output[[:space:]]+ok' "${test_dir}/doctor-default-output.output"
+
+if (( EUID != 0 )); then
+    mkdir -p "${test_dir}/home"
+    HOME="${test_dir}/home" XDG_STATE_HOME='' CPU_BENCHMARK_CPU_LIST=0 \
+        bash "${repo_dir}/cpu-benchmark.sh" --quick > "${test_dir}/non-root-console.log"
+    compgen -G "${test_dir}/home/.local/state/cpu-benchmarks/*.json" >/dev/null
+fi
 
 upload_port_file="${test_dir}/upload-port"
 upload_capture="${test_dir}/uploaded-reports.jsonl"
@@ -249,9 +259,29 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     report = json.load(handle)
 
 cpu = report["benchmarks"]["sysbench_cpu"]
+assert cpu["engine"] == "sysbench"
 assert cpu["single_core"]["status"] == "ok"
 assert cpu["all_logical_cpus"]["status"] == "ok"
 assert all(item["status"] == "unsupported" for item in cpu["per_logical_cpu"])
+PY
+
+mv "${mock_bin}/sysbench" "${mock_bin}/sysbench.disabled"
+bash "${repo_dir}/cpu-benchmark.sh" --quick \
+    --output "${test_dir}/portable.json" > "${test_dir}/portable-console.log"
+mv "${mock_bin}/sysbench.disabled" "${mock_bin}/sysbench"
+"$host_python" - "${test_dir}/portable.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+cpu = report["benchmarks"]["sysbench_cpu"]
+assert cpu["engine"] == "portable_python"
+assert cpu["single_core"]["events_per_second"] > 0
+assert cpu["all_logical_cpus"]["events_per_second"] > 0
+assert all(item["events_per_second"] > 0 for item in cpu["per_logical_cpu"])
+assert any("portable Python engine" in note for note in report["notes"])
 PY
 
 BASH_COMPAT=3.2 MOCK_UNAME_S=Darwin MOCK_UNAME_M=arm64 bash "${repo_dir}/cpu-benchmark.sh" \

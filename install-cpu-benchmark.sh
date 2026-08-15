@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.4.0"
+readonly INSTALLER_VERSION="1.5.0"
 readonly DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/cpu-benchmark.sh"
 readonly DEFAULT_INSTALL_PATH="/usr/local/bin/cpu-benchmark"
 
@@ -24,12 +24,14 @@ Options:
   --source-url URL   Download the benchmark from URL instead of GitHub main
   --install-path PATH
                      Install the command at PATH (default: /usr/local/bin/cpu-benchmark)
-  --skip-packages    Install only the script; do not use a package manager
+  --skip-packages, --portable
+                     Install only the script; use its Python fallback if needed
   --dry-run          Show detected distribution and package plan without changes
   --version          Print the installer version and exit
   -h, --help         Show this help
 
-Supported package managers: apt, dnf, yum, zypper, pacman, and apk.
+Supported package managers: apt, dnf, yum, zypper, pacman, apk, xbps, emerge,
+and opkg. Unknown/minimal distributions fall back to script-only installation.
 The real installation requires root; --help, --version, and --dry-run do not.
 USAGE
 }
@@ -66,7 +68,7 @@ while (( $# > 0 )); do
             INSTALL_PATH=$2
             shift
             ;;
-        --skip-packages)
+        --skip-packages|--portable)
             SKIP_PACKAGES=true
             ;;
         --dry-run)
@@ -91,10 +93,9 @@ if [[ $DRY_RUN != true ]] && (( EUID != 0 )); then
     die "This installer must be run as root (try: sudo bash install-cpu-benchmark.sh)."
 fi
 
-[[ -r $OS_RELEASE_FILE ]] || die "Cannot detect this operating system: '$OS_RELEASE_FILE' is missing."
-
 os_release_value() {
     local key=$1
+    [[ -r $OS_RELEASE_FILE ]] || return 0
     awk -F= -v key="$key" '$1 == key {
         value=substr($0, index($0, "=") + 1)
         gsub(/^"|"$/, "", value)
@@ -125,6 +126,12 @@ elif [[ $OS_ID =~ ^(opensuse.*|sles)$ || $OS_ID_LIKE == *suse* ]]; then
     DISTRIBUTION="openSUSE/SUSE family"
 elif [[ $OS_ID == "alpine" ]]; then
     DISTRIBUTION="Alpine Linux"
+elif [[ $OS_ID == "void" ]]; then
+    DISTRIBUTION="Void Linux"
+elif [[ $OS_ID == "gentoo" || $OS_ID_LIKE == *gentoo* ]]; then
+    DISTRIBUTION="Gentoo Linux"
+elif [[ $OS_ID == "openwrt" ]]; then
+    DISTRIBUTION="OpenWrt"
 else
     DISTRIBUTION="$OS_PRETTY_NAME"
 fi
@@ -137,10 +144,11 @@ detect_package_manager() {
         return 0
     fi
 
-    for candidate in apt-get dnf yum zypper pacman apk; do
+    for candidate in apt-get dnf yum zypper pacman apk xbps-install emerge opkg; do
         if command -v "$candidate" >/dev/null 2>&1; then
             case $candidate in
                 apt-get) printf 'apt\n' ;;
+                xbps-install) printf 'xbps\n' ;;
                 *) printf '%s\n' "$candidate" ;;
             esac
             return 0
@@ -150,12 +158,18 @@ detect_package_manager() {
 }
 
 if [[ $SKIP_PACKAGES != true ]]; then
-    PACKAGE_MANAGER=$(detect_package_manager) || die \
-        "No supported package manager found. Use --skip-packages after installing sysbench and python3 manually."
+    if ! PACKAGE_MANAGER=$(detect_package_manager); then
+        PACKAGE_MANAGER="none"
+        SKIP_PACKAGES=true
+        warn "No supported package manager found; installing the portable script without package changes."
+    fi
     case $PACKAGE_MANAGER in
-        apt|dnf|yum|zypper|pacman|apk) ;;
+        apt|dnf|yum|zypper|pacman|apk|xbps|emerge|opkg|none) ;;
         *) die "Unsupported package manager override '$PACKAGE_MANAGER'." ;;
     esac
+    if [[ $PACKAGE_MANAGER == "none" ]]; then
+        SKIP_PACKAGES=true
+    fi
 else
     PACKAGE_MANAGER=${PACKAGE_MANAGER:-skipped}
 fi
@@ -189,6 +203,15 @@ run_package_update() {
         apk)
             apk update
             ;;
+        xbps)
+            xbps-install -S
+            ;;
+        emerge)
+            log "Gentoo uses its currently configured package repository; automatic emerge --sync is intentionally skipped."
+            ;;
+        opkg)
+            opkg update
+            ;;
     esac
 }
 
@@ -203,6 +226,9 @@ package_available() {
         zypper) zypper --non-interactive --no-refresh install --dry-run "$package" >/dev/null 2>&1 ;;
         pacman) pacman -Si "$package" >/dev/null 2>&1 ;;
         apk) apk search -x "$package" 2>/dev/null | grep -q . ;;
+        xbps) xbps-query -Rs "^${package}-[0-9]" 2>/dev/null | grep -q . ;;
+        emerge) emerge --search "$package" 2>/dev/null | grep -q '^\*' ;;
+        opkg) opkg list "$package" 2>/dev/null | grep -q "^${package} -" ;;
     esac
 }
 
@@ -221,6 +247,9 @@ install_package() {
         zypper) zypper --non-interactive install --no-recommends "$package" ;;
         pacman) pacman -S --needed --noconfirm "$package" ;;
         apk) apk add --no-cache "$package" ;;
+        xbps) xbps-install -y "$package" ;;
+        emerge) emerge --quiet-build=y "$package" ;;
+        opkg) opkg install "$package" ;;
     esac
 }
 
@@ -254,12 +283,14 @@ install_optional_candidates() {
 }
 
 if [[ $SKIP_PACKAGES != true ]]; then
-    run_package_update
+    if ! run_package_update; then
+        warn "Package index refresh failed; trying the configured package cache and repositories."
+    fi
     case $PACKAGE_MANAGER in
         apt)
-            install_required_candidates "sysbench" sysbench
             install_required_candidates "Python 3" python3
-            install_required_candidates "util-linux" util-linux
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
             install_optional_candidates "stress-ng" stress-ng
             install_optional_candidates "perf" linux-perf perf "linux-tools-$(uname -r)" linux-tools-generic
             install_optional_candidates "cpupower" linux-cpupower linux-tools-common "linux-tools-$(uname -r)"
@@ -267,18 +298,18 @@ if [[ $SKIP_PACKAGES != true ]]; then
             install_optional_candidates "temperature sensors" lm-sensors
             ;;
         dnf|yum)
-            install_required_candidates "sysbench" sysbench
             install_required_candidates "Python 3" python3
-            install_required_candidates "util-linux" util-linux
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
             install_optional_candidates "stress-ng" stress-ng
             install_optional_candidates "perf" perf
             install_optional_candidates "cpupower/turbostat" kernel-tools
             install_optional_candidates "temperature sensors" lm_sensors
             ;;
         zypper)
-            install_required_candidates "sysbench" sysbench
             install_required_candidates "Python 3" python3
-            install_required_candidates "util-linux" util-linux
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
             install_optional_candidates "stress-ng" stress-ng
             install_optional_candidates "perf" perf
             install_optional_candidates "cpupower" cpupower
@@ -286,22 +317,45 @@ if [[ $SKIP_PACKAGES != true ]]; then
             install_optional_candidates "temperature sensors" sensors lm_sensors
             ;;
         pacman)
-            install_required_candidates "sysbench" sysbench
             install_required_candidates "Python 3" python python3
-            install_required_candidates "util-linux" util-linux
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
             install_optional_candidates "stress-ng" stress-ng
             install_optional_candidates "perf" perf
             install_optional_candidates "cpupower/turbostat" linux-tools
             install_optional_candidates "temperature sensors" lm_sensors
             ;;
         apk)
-            install_required_candidates "sysbench" sysbench
             install_required_candidates "Python 3" python3
-            install_required_candidates "util-linux" util-linux
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
             install_optional_candidates "stress-ng" stress-ng
             install_optional_candidates "perf" perf
             install_optional_candidates "cpupower/turbostat" linux-tools
             install_optional_candidates "temperature sensors" lm-sensors
+            ;;
+        xbps)
+            install_required_candidates "Python 3" python3
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" util-linux
+            install_optional_candidates "stress-ng" stress-ng
+            install_optional_candidates "perf" perf
+            install_optional_candidates "temperature sensors" lm_sensors
+            ;;
+        emerge)
+            install_required_candidates "Python 3" dev-lang/python
+            install_optional_candidates "sysbench" app-benchmarks/sysbench
+            install_optional_candidates "util-linux/taskset" sys-apps/util-linux
+            install_optional_candidates "stress-ng" app-benchmarks/stress-ng
+            install_optional_candidates "perf" dev-util/perf
+            install_optional_candidates "cpupower" sys-power/cpupower
+            install_optional_candidates "temperature sensors" sys-apps/lm-sensors
+            ;;
+        opkg)
+            install_required_candidates "Python 3" python3 python3-light
+            install_optional_candidates "sysbench" sysbench
+            install_optional_candidates "util-linux/taskset" taskset util-linux
+            install_optional_candidates "temperature sensors" lm-sensors sensors
             ;;
     esac
 else

@@ -1,10 +1,9 @@
 # CPU Benchmark Toolkit
 
-A reusable, non-invasive CPU benchmarking toolkit for Debian/Ubuntu,
-Proxmox VE, Fedora/RHEL, Amazon Linux, Arch, openSUSE, Alpine, Windows through
-WSL, and macOS. It measures sysbench single-core, all-logical-CPU, and
-per-logical-CPU performance and adds Linux hardware telemetry when the kernel
-and processor expose it.
+A reusable, non-invasive CPU benchmarking toolkit for Linux VPSs, dedicated
+servers, containers, Proxmox VE, Windows through WSL, and macOS. It measures
+single-core, all-logical-CPU, and per-logical-CPU performance and adds hardware
+telemetry when the operating system, hypervisor, and processor expose it.
 
 The toolkit never changes the CPU governor, frequency limits, power limits, or
 other tuning settings. It does not use or install Docker.
@@ -27,14 +26,19 @@ From a cloned checkout, the installer uses the adjacent `cpu-benchmark.sh`:
 sudo bash install-cpu-benchmark.sh
 ```
 
-The installer automatically detects APT, DNF, YUM, Zypper, Pacman, or APK. This
+The installer automatically detects APT, DNF, YUM, Zypper, Pacman, APK, XBPS,
+Portage, or OPKG. This
 covers Debian, Ubuntu and their derivatives, Proxmox VE, Fedora, RHEL, Rocky,
 AlmaLinux, CentOS, Oracle Linux, Amazon Linux, Arch, Manjaro, openSUSE, SUSE,
-and Alpine. It uses the configured package indexes (refreshing them where safe),
+Alpine, Void, Gentoo, and OpenWrt. Unknown or very minimal Linux images receive
+a script-only portable installation instead of being rejected. The installer
+uses configured package indexes (refreshing them where safe),
 installs the required benchmark tools, and installs the command as
 `/usr/local/bin/cpu-benchmark`. Optional
 `stress-ng`, `perf`, `cpupower`, `turbostat`, and sensor packages are installed
 when the distribution provides them and never block the core installation.
+If `sysbench` is unavailable, the benchmark automatically uses its bundled
+Python CPU engine; reports identify the engine so unlike scores are not mixed.
 
 Alpine does not include Bash by default, so bootstrap it first:
 
@@ -51,20 +55,26 @@ bash install-cpu-benchmark.sh --dry-run
 # Install only the script when dependencies are already managed separately
 curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | sudo bash -s -- --skip-packages
 
+# Portable alias for minimal, immutable, or custom VPS images
+curl -fsSL https://raw.githubusercontent.com/GGWPs/cpu-benchmark/main/install-cpu-benchmark.sh | sudo bash -s -- --portable
+
 # Custom destination or mirror/source
 sudo bash install-cpu-benchmark.sh --install-path /opt/bin/cpu-benchmark
 sudo bash install-cpu-benchmark.sh --source-url https://mirror.example/cpu-benchmark.sh
 ```
 
-The installer does not enable third-party repositories. RHEL-family systems
-must make `sysbench` available through an approved configured repository when
-their base repositories do not provide it.
+The installer does not enable third-party repositories. Only Bash and Python 3
+are needed for the portable path. RHEL-family and other minimal systems use the
+portable engine when their configured repositories do not provide `sysbench`.
 
 ## Usage
 
 ```bash
-# Short run; writes JSON and a text summary under /root/cpu-benchmarks/
+# Short run; root writes under /root/cpu-benchmarks/
 sudo cpu-benchmark --quick
+
+# Non-root runs need no extra option; output normally goes under ~/.local/state/
+cpu-benchmark --quick
 
 # Longer run with more stable samples
 sudo cpu-benchmark --full
@@ -99,15 +109,21 @@ the console as each measurement starts.
 
 ## Platform notes
 
-- **Linux:** Debian/Ubuntu derivatives, Proxmox VE, Fedora/RHEL derivatives,
-  Amazon Linux, Arch derivatives, openSUSE/SUSE, and Alpine have automatic
-  package-manager support. Linux per-CPU tests are pinned with `taskset`.
+- **Linux/VPS:** Debian/Ubuntu derivatives, Proxmox VE, Fedora/RHEL derivatives,
+  Amazon Linux, Arch derivatives, openSUSE/SUSE, Alpine, Void, Gentoo, and
+  OpenWrt have automatic package-manager support. Unknown distributions can use
+  the portable installer. Linux per-CPU tests are pinned with `taskset`.
   Hardware counters use `perf`; package power,
   temperature, and effective MHz use `turbostat` when supported. In containers
   and restricted services, only CPUs allowed by the current cgroup/cpuset are
   benchmarked. If `taskset` is missing or affinity is blocked, single/all-CPU
   tests still run unpinned and only the per-CPU affinity results are marked
   unsupported.
+- **Minimal and restricted VPSs:** missing `sysbench` selects the portable
+  Python benchmark engine. Missing `taskset`, `perf`, `turbostat`, `cpupower`,
+  `stress-ng`, sensor access, MSRs, or cpufreq data remains non-fatal. Reports
+  include the detected VM/container environment and cgroup CPU quota where
+  available. A non-root run automatically selects a user-writable output path.
 - **Windows:** run the installer and benchmark inside a Debian or Ubuntu WSL
   distribution. WSL is detected and reported as platform `windows` with the
   `windows-wsl` environment. During a separate all-core workload, the script
@@ -141,7 +157,7 @@ The JSON contains:
 - Per-CPU frequency, governor, and driver data from Linux sysfs
 - Available hwmon and thermal-zone temperatures
 - Optional normalized `lm-sensors -j` temperatures with their source
-- Single-core, all-CPU, and per-logical-CPU sysbench results
+- Benchmark engine plus single-core, all-CPU, and per-logical-CPU results
 - cycles, instructions, calculated IPC, cache misses, and branch misses
 - turbostat package watts, package temperature, and effective MHz
 - Windows host effective MHz and optional hardware-monitor CPU temperature when

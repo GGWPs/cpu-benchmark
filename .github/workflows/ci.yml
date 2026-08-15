@@ -53,4 +53,4 @@ jobs:
       - name: Verify installed command
         run: |
           test -x /tmp/cpu-benchmark
-          test "$(/tmp/cpu-benchmark --version)" = "cpu-benchmark 1.4.0"
+          test "$(/tmp/cpu-benchmark --version)" = "cpu-benchmark 1.5.0"
